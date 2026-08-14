@@ -24,7 +24,6 @@ Project:
     python train_rgbt.py \
     --cfg configs/experiments/lrdd_rgbt_yolo26n_640.yaml
 """
-
 from __future__ import annotations
 
 import argparse
