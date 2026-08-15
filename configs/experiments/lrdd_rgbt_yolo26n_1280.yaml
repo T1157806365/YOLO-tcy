@@ -19,7 +19,7 @@ data:
   tir: /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/LRDD_v3-TIR.yaml
 
   # 第一组 baseline 先保持一致
-  rgb_imgsz: 640
+  rgb_imgsz: 1280
   tir_imgsz: 640
 
   # 如果你的 Dataset 测试是 stem，就改成 stem
@@ -29,9 +29,9 @@ data:
 # ============================================================
 train:
   epochs: 300
-  batch: 24
+  batch: 8
   workers: 4
-  device: 5
+  device: 4
   optimizer: SGD
   lr0: 0.01
   lrf: 0.01
@@ -64,4 +64,4 @@ loss:
 # ============================================================
 output:
   project: runs/rgbt
-  name: yolo26n_LRDDv3_rgbt_concat_640_b24_seed0
+  name: yolo26n_LRDDv3_rgbt_concat_1280_b8_seed0

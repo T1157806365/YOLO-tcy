@@ -20,9 +20,10 @@ Project:
     /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
 
     训练
+    conda activate tcy
     cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
     python train_rgbt.py \
-    --cfg configs/experiments/lrdd_rgbt_yolo26n_640.yaml
+    --cfg configs/experiments/lrdd_rgbt_yolo26n_1280.yaml
 """
 from __future__ import annotations
 
