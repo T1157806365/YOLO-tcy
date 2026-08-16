@@ -41,10 +41,18 @@ train:
   seed: 0
   deterministic: true
   grad_clip: 10.0
+  patience: 50
+  early_stop_min_delta: 0.000001
   # 不断点续训
   resume: null
 # /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rgbt/yolo26n_LRDDv3_rgbt_concat_640_b24_seed0/weights/last.pt
-
+  stage2:
+    enabled: true
+    epochs: 200
+    lr0: 0.001
+    lrf: 0.01
+    patience: 50
+    early_stop_min_delta: 0.000001
 # ============================================================
 # Augmentation
 # ============================================================

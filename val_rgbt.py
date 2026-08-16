@@ -1,20 +1,4 @@
 """
-RGB-T Dual-Backbone YOLO Validation
-===================================
-
-Project:
-    /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
-
-Main paper metrics:
-    Params (M)
-    FLOPs (G)
-    FPS
-    P (%)
-    R (%)
-    AP50 (%)
-    AP75 (%)
-    AP50:95 (%)
-
 Architecture:
     RGB -> Backbone-R --\
                          -> Feature Fusion -> YOLO Neck -> Detect
@@ -37,7 +21,19 @@ Current task:
     --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rgbt/yolo26n_LRDDv3_rgbt_concat_640_b24_seed0/weights/best.pt \
     --rgb /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/LRDD_v3-RGB.yaml \
     --tir /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/LRDD_v3-TIR.yaml \
-    --split val \
+    --split test \
+    --rgb-imgsz 640 \
+    --tir-imgsz 640 \
+    --batch 4 \
+    --device 0
+
+    conda activate tcy
+    cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
+    python val_rgbt.py \
+    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rgbt/yolo26n_uavcb_rgbt_concat_640_b24_seed0/weights/best.pt \
+    --rgb /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml \
+    --tir /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml \
+    --split test \
     --rgb-imgsz 640 \
     --tir-imgsz 640 \
     --batch 4 \
@@ -54,6 +50,7 @@ import time
 from pathlib import Path
 from typing import Dict
 
+import cv2
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -1135,8 +1132,796 @@ def process_single_image(
     )
 
 
+
 # ============================================================
-# 13. Load custom checkpoint
+# 13. Preview visualization helpers
+# ============================================================
+
+def tensor_to_bgr(
+    image_tensor: torch.Tensor,
+) -> np.ndarray:
+    """
+    Convert one network-input RGB tensor to OpenCV BGR uint8 image.
+
+    Input:
+        [3, H, W], float in [0, 1]
+
+    Output:
+        [H, W, 3], uint8 BGR
+    """
+
+    image = (
+        image_tensor
+        .detach()
+        .float()
+        .cpu()
+        .clamp(
+            0.0,
+            1.0,
+        )
+        .permute(
+            1,
+            2,
+            0,
+        )
+        .numpy()
+    )
+
+    image = (
+        image
+        * 255.0
+    ).astype(
+        np.uint8
+    )
+
+    return cv2.cvtColor(
+        image,
+        cv2.COLOR_RGB2BGR,
+    )
+
+
+def _draw_top_bar(
+    image: np.ndarray,
+    text: str,
+):
+    """
+    Draw a black title bar on one preview tile.
+    """
+
+    h, w = image.shape[:2]
+
+    font_scale = max(
+        0.45,
+        min(
+            h,
+            w,
+        )
+        / 1200.0,
+    )
+
+    thickness = max(
+        1,
+        int(
+            min(
+                h,
+                w,
+            )
+            / 500
+        ),
+    )
+
+    (
+        text_w,
+        text_h,
+    ), baseline = cv2.getTextSize(
+        text,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        thickness,
+    )
+
+    bar_h = max(
+        text_h
+        + baseline
+        + 12,
+        28,
+    )
+
+    cv2.rectangle(
+        image,
+        (
+            0,
+            0,
+        ),
+        (
+            w - 1,
+            min(
+                bar_h,
+                h - 1,
+            ),
+        ),
+        (
+            0,
+            0,
+            0,
+        ),
+        -1,
+    )
+
+    cv2.putText(
+        image,
+        text,
+        (
+            8,
+            min(
+                text_h + 7,
+                h - 5,
+            ),
+        ),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        (
+            255,
+            255,
+            255,
+        ),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def draw_prediction_tile(
+    image_bgr: np.ndarray,
+    pred: Dict,
+    image_name: str,
+    preview_conf: float = 0.25,
+) -> np.ndarray:
+    """
+    Draw prediction boxes only.
+
+    Red:
+        predicted UAV box
+
+    Text:
+        UAV confidence
+
+    The metric confidence threshold can still be 0.001.
+    preview_conf only controls which boxes are displayed.
+    """
+
+    image = image_bgr.copy()
+
+    h, w = image.shape[:2]
+
+    thickness = max(
+        2,
+        int(
+            min(
+                h,
+                w,
+            )
+            / 320
+        ),
+    )
+
+    font_scale = max(
+        0.45,
+        min(
+            h,
+            w,
+        )
+        / 1100.0,
+    )
+
+    pred_boxes = (
+        pred[
+            "bboxes"
+        ]
+        .detach()
+        .float()
+        .cpu()
+        .numpy()
+    )
+
+    pred_conf = (
+        pred[
+            "conf"
+        ]
+        .detach()
+        .float()
+        .cpu()
+        .numpy()
+    )
+
+    shown = 0
+
+    for box, conf in zip(
+        pred_boxes,
+        pred_conf,
+    ):
+
+        conf = float(
+            conf
+        )
+
+        if conf < preview_conf:
+            continue
+
+        x1, y1, x2, y2 = [
+            int(v)
+            for v in box
+        ]
+
+        x1 = int(
+            np.clip(
+                x1,
+                0,
+                w - 1,
+            )
+        )
+
+        y1 = int(
+            np.clip(
+                y1,
+                0,
+                h - 1,
+            )
+        )
+
+        x2 = int(
+            np.clip(
+                x2,
+                0,
+                w - 1,
+            )
+        )
+
+        y2 = int(
+            np.clip(
+                y2,
+                0,
+                h - 1,
+            )
+        )
+
+        cv2.rectangle(
+            image,
+            (
+                x1,
+                y1,
+            ),
+            (
+                x2,
+                y2,
+            ),
+            (
+                0,
+                0,
+                255,
+            ),
+            thickness,
+        )
+
+        label = (
+            f"UAV {conf:.2f}"
+        )
+
+        (
+            text_w,
+            text_h,
+        ), baseline = cv2.getTextSize(
+            label,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            thickness,
+        )
+
+        text_y = max(
+            y1,
+            text_h
+            + baseline
+            + 4,
+        )
+
+        cv2.rectangle(
+            image,
+            (
+                x1,
+                text_y
+                - text_h
+                - baseline
+                - 5,
+            ),
+            (
+                min(
+                    x1
+                    + text_w
+                    + 6,
+                    w - 1,
+                ),
+                text_y + 2,
+            ),
+            (
+                0,
+                0,
+                255,
+            ),
+            -1,
+        )
+
+        cv2.putText(
+            image,
+            label,
+            (
+                x1 + 3,
+                text_y - 3,
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (
+                255,
+                255,
+                255,
+            ),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+        shown += 1
+
+    title = (
+        f"PRED | {image_name} | "
+        f"boxes={shown} | "
+        f"conf>={preview_conf:.2f}"
+    )
+
+    _draw_top_bar(
+        image,
+        title,
+    )
+
+    if shown == 0:
+
+        message = (
+            f"No prediction >= "
+            f"{preview_conf:.2f}"
+        )
+
+        cv2.putText(
+            image,
+            message,
+            (
+                20,
+                max(
+                    h // 2,
+                    40,
+                ),
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            max(
+                0.6,
+                font_scale,
+            ),
+            (
+                0,
+                0,
+                255,
+            ),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+    return image
+
+
+def draw_ground_truth_tile(
+    image_bgr: np.ndarray,
+    gt: Dict,
+    image_name: str,
+) -> np.ndarray:
+    """
+    Draw ground-truth boxes only.
+
+    Green:
+        ground-truth UAV box
+    """
+
+    image = image_bgr.copy()
+
+    h, w = image.shape[:2]
+
+    thickness = max(
+        2,
+        int(
+            min(
+                h,
+                w,
+            )
+            / 320
+        ),
+    )
+
+    font_scale = max(
+        0.45,
+        min(
+            h,
+            w,
+        )
+        / 1100.0,
+    )
+
+    gt_boxes = (
+        gt[
+            "bboxes"
+        ]
+        .detach()
+        .float()
+        .cpu()
+        .numpy()
+    )
+
+    for box in gt_boxes:
+
+        x1, y1, x2, y2 = [
+            int(v)
+            for v in box
+        ]
+
+        x1 = int(
+            np.clip(
+                x1,
+                0,
+                w - 1,
+            )
+        )
+
+        y1 = int(
+            np.clip(
+                y1,
+                0,
+                h - 1,
+            )
+        )
+
+        x2 = int(
+            np.clip(
+                x2,
+                0,
+                w - 1,
+            )
+        )
+
+        y2 = int(
+            np.clip(
+                y2,
+                0,
+                h - 1,
+            )
+        )
+
+        cv2.rectangle(
+            image,
+            (
+                x1,
+                y1,
+            ),
+            (
+                x2,
+                y2,
+            ),
+            (
+                0,
+                255,
+                0,
+            ),
+            thickness,
+        )
+
+        label = "GT UAV"
+
+        (
+            text_w,
+            text_h,
+        ), baseline = cv2.getTextSize(
+            label,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            thickness,
+        )
+
+        text_y = max(
+            y1,
+            text_h
+            + baseline
+            + 4,
+        )
+
+        cv2.rectangle(
+            image,
+            (
+                x1,
+                text_y
+                - text_h
+                - baseline
+                - 5,
+            ),
+            (
+                min(
+                    x1
+                    + text_w
+                    + 6,
+                    w - 1,
+                ),
+                text_y + 2,
+            ),
+            (
+                0,
+                150,
+                0,
+            ),
+            -1,
+        )
+
+        cv2.putText(
+            image,
+            label,
+            (
+                x1 + 3,
+                text_y - 3,
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (
+                255,
+                255,
+                255,
+            ),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+    title = (
+        f"GROUND TRUTH | {image_name} | "
+        f"boxes={len(gt_boxes)}"
+    )
+
+    _draw_top_bar(
+        image,
+        title,
+    )
+
+    return image
+
+
+def make_image_grid(
+    images: list[np.ndarray],
+    cols: int = 3,
+    gap: int = 8,
+) -> np.ndarray:
+    """
+    Combine preview tiles into one grid.
+
+    Default:
+        6 images
+        ->
+        2 rows x 3 columns
+    """
+
+    if not images:
+
+        raise ValueError(
+            "preview images 为空，无法生成拼图。"
+        )
+
+    cols = max(
+        int(
+            cols
+        ),
+        1,
+    )
+
+    gap = max(
+        int(
+            gap
+        ),
+        0,
+    )
+
+    tile_h, tile_w = (
+        images[0].shape[:2]
+    )
+
+    resized = []
+
+    for image in images:
+
+        if (
+            image.shape[0]
+            != tile_h
+            or image.shape[1]
+            != tile_w
+        ):
+
+            image = cv2.resize(
+                image,
+                (
+                    tile_w,
+                    tile_h,
+                ),
+                interpolation=cv2.INTER_LINEAR,
+            )
+
+        resized.append(
+            image
+        )
+
+    rows = int(
+        np.ceil(
+            len(
+                resized
+            )
+            / cols
+        )
+    )
+
+    grid_h = (
+        rows
+        * tile_h
+        + (
+            rows - 1
+        )
+        * gap
+    )
+
+    grid_w = (
+        cols
+        * tile_w
+        + (
+            cols - 1
+        )
+        * gap
+    )
+
+    grid = np.full(
+        (
+            grid_h,
+            grid_w,
+            3,
+        ),
+        245,
+        dtype=np.uint8,
+    )
+
+    for index, image in enumerate(
+        resized
+    ):
+
+        row = (
+            index
+            // cols
+        )
+
+        col = (
+            index
+            % cols
+        )
+
+        y1 = (
+            row
+            * (
+                tile_h
+                + gap
+            )
+        )
+
+        x1 = (
+            col
+            * (
+                tile_w
+                + gap
+            )
+        )
+
+        grid[
+            y1:
+            y1 + tile_h,
+            x1:
+            x1 + tile_w,
+        ] = image
+
+    return grid
+
+
+def save_preview_grids(
+    prediction_tiles: list[np.ndarray],
+    ground_truth_tiles: list[np.ndarray],
+    preview_dir: Path,
+    split: str,
+    preview_conf: float,
+    cols: int = 3,
+):
+    """
+    Save two composite preview images:
+
+        1. prediction grid
+        2. ground-truth grid
+
+    The same sample order is used in both grids.
+    """
+
+    preview_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    paths = {
+        "prediction":
+            None,
+
+        "ground_truth":
+            None,
+    }
+
+    if prediction_tiles:
+
+        pred_grid = make_image_grid(
+            prediction_tiles,
+            cols=cols,
+        )
+
+        pred_path = (
+            preview_dir
+            / (
+                f"{split}_prediction_grid_"
+                f"{len(prediction_tiles)}_"
+                f"conf{preview_conf:.2f}.jpg"
+            )
+        )
+
+        success = cv2.imwrite(
+            str(
+                pred_path
+            ),
+            pred_grid,
+        )
+
+        if success:
+            paths[
+                "prediction"
+            ] = pred_path
+
+    if ground_truth_tiles:
+
+        gt_grid = make_image_grid(
+            ground_truth_tiles,
+            cols=cols,
+        )
+
+        gt_path = (
+            preview_dir
+            / (
+                f"{split}_ground_truth_grid_"
+                f"{len(ground_truth_tiles)}.jpg"
+            )
+        )
+
+        success = cv2.imwrite(
+            str(
+                gt_path
+            ),
+            gt_grid,
+        )
+
+        if success:
+            paths[
+                "ground_truth"
+            ] = gt_path
+
+    return paths
+
+
+# ============================================================
+# 14. Load custom checkpoint
 # ============================================================
 
 def load_rgbt_checkpoint(
@@ -1283,7 +2068,7 @@ def load_rgbt_checkpoint(
 
 
 # ============================================================
-# 14. Save CSV
+# 15. Save CSV
 # ============================================================
 
 def save_metrics_csv(
@@ -1351,7 +2136,7 @@ def save_metrics_csv(
 
 
 # ============================================================
-# 15. Main validation
+# 16. Main validation
 # ============================================================
 
 @torch.inference_mode()
@@ -1387,6 +2172,12 @@ def validate(
     save_dir: str | None = None,
 
     plots: bool = False,
+
+    preview_num: int = 6,
+
+    preview_conf: float = 0.25,
+
+    preview_cols: int = 3,
 
     speed_warmup: int = 20,
 
@@ -1507,6 +2298,48 @@ def validate(
         parents=True,
         exist_ok=True,
     )
+
+    # ========================================================
+    # Preview output
+    # ========================================================
+
+    preview_dir = (
+        save_dir
+        / "previews"
+    )
+
+    preview_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    preview_num = max(
+        int(
+            preview_num
+        ),
+        0,
+    )
+
+    preview_cols = max(
+        int(
+            preview_cols
+        ),
+        1,
+    )
+
+    prediction_preview_tiles = []
+
+    ground_truth_preview_tiles = []
+
+    preview_saved = 0
+
+    preview_paths = {
+        "prediction":
+            None,
+
+        "ground_truth":
+            None,
+    }
 
     # ========================================================
     # Complexity
@@ -1900,6 +2733,60 @@ def validate(
                 sample_index,
             )
 
+            # =================================================
+            # Collect exactly the same samples for:
+            #
+            #   prediction grid
+            #   ground-truth grid
+            #
+            # Only use positive-GT images so all preview slots
+            # are useful for UAV inspection.
+            # =================================================
+
+            if (
+                preview_saved
+                < preview_num
+                and gt[
+                    "bboxes"
+                ].shape[0] > 0
+            ):
+
+                image_bgr = tensor_to_bgr(
+                    batch[
+                        "rgb_img"
+                    ][sample_index]
+                )
+
+                image_name = Path(
+                    batch[
+                        "rgb_path"
+                    ][sample_index]
+                ).name
+
+                prediction_preview_tiles.append(
+                    draw_prediction_tile(
+                        image_bgr=image_bgr,
+
+                        pred=pred,
+
+                        image_name=image_name,
+
+                        preview_conf=preview_conf,
+                    )
+                )
+
+                ground_truth_preview_tiles.append(
+                    draw_ground_truth_tile(
+                        image_bgr=image_bgr,
+
+                        gt=gt,
+
+                        image_name=image_name,
+                    )
+                )
+
+                preview_saved += 1
+
             tp = process_single_image(
                 pred=pred,
 
@@ -2016,6 +2903,30 @@ def validate(
         )
 
     pbar.close()
+
+    # ========================================================
+    # Save composite preview grids
+    # ========================================================
+
+    if preview_saved > 0:
+
+        preview_paths = save_preview_grids(
+            prediction_tiles=(
+                prediction_preview_tiles
+            ),
+
+            ground_truth_tiles=(
+                ground_truth_preview_tiles
+            ),
+
+            preview_dir=preview_dir,
+
+            split=split,
+
+            preview_conf=preview_conf,
+
+            cols=preview_cols,
+        )
 
     # ========================================================
     # Process metrics
@@ -2538,6 +3449,50 @@ def validate(
         },
 
         # ----------------------------------------------------
+        # Preview grids
+        # ----------------------------------------------------
+
+        "previews": {
+            "num_samples":
+                int(
+                    preview_saved
+                ),
+
+            "preview_conf":
+                float(
+                    preview_conf
+                ),
+
+            "prediction_grid":
+                (
+                    str(
+                        preview_paths[
+                            "prediction"
+                        ]
+                    )
+                    if preview_paths[
+                        "prediction"
+                    ]
+                    is not None
+                    else None
+                ),
+
+            "ground_truth_grid":
+                (
+                    str(
+                        preview_paths[
+                            "ground_truth"
+                        ]
+                    )
+                    if preview_paths[
+                        "ground_truth"
+                    ]
+                    is not None
+                    else None
+                ),
+        },
+
+        # ----------------------------------------------------
         # Speed
         # ----------------------------------------------------
 
@@ -2713,6 +3668,21 @@ def validate(
     )
 
     print(
+        f"Preview samples   : "
+        f"{preview_saved}"
+    )
+
+    print(
+        f"Prediction grid   : "
+        f"{preview_paths['prediction']}"
+    )
+
+    print(
+        f"Ground-truth grid : "
+        f"{preview_paths['ground_truth']}"
+    )
+
+    print(
         "============================================================\n"
     )
 
@@ -2720,7 +3690,7 @@ def validate(
 
 
 # ============================================================
-# 16. CLI
+# 17. CLI
 # ============================================================
 
 if __name__ == "__main__":
@@ -2955,6 +3925,45 @@ if __name__ == "__main__":
         ),
     )
 
+    parser.add_argument(
+        "--preview-num",
+
+        type=int,
+
+        default=6,
+
+        help=(
+            "Number of positive RGB samples used in "
+            "the composite preview grids"
+        ),
+    )
+
+    parser.add_argument(
+        "--preview-conf",
+
+        type=float,
+
+        default=0.25,
+
+        help=(
+            "Confidence threshold used only when "
+            "drawing prediction preview boxes"
+        ),
+    )
+
+    parser.add_argument(
+        "--preview-cols",
+
+        type=int,
+
+        default=3,
+
+        help=(
+            "Number of columns in preview grid; "
+            "default 3 gives a 2x3 grid for 6 images"
+        ),
+    )
+
     # ========================================================
     # Parse
     # ========================================================
@@ -2993,6 +4002,12 @@ if __name__ == "__main__":
         save_dir=args.save_dir,
 
         plots=args.plots,
+
+        preview_num=args.preview_num,
+
+        preview_conf=args.preview_conf,
+
+        preview_cols=args.preview_cols,
 
         speed_warmup=args.speed_warmup,
 

@@ -24,10 +24,16 @@ Project:
     cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
     python train_rgbt.py \
     --cfg configs/experiments/lrdd_rgbt_yolo26n_1280.yaml
+
+    conda activate tcy
+    cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
+    python train_rgbt.py \
+    --cfg configs/experiments/uavcb_rgbt_yolo26n_640.yaml
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -490,38 +496,88 @@ def configure_model_loss(
 
 def save_checkpoint(
     path: Path,
-
     model,
-
     optimizer,
-
     scheduler,
-
     scaler,
-
     epoch: int,
-
-    best_val_loss: float,
-
+    best_map5095: float,
     cfg: Dict,
+    stage: str = "stage1",
+    stage_epoch: int | None = None,
+    global_epoch: int | None = None,
+    best_val_loss: float = float("inf"),
+    early_stop_counter: int = 0,
 ):
     """
     Save custom RGB-T checkpoint.
 
-    NOTE:
-    This is a YOLO-tcy custom checkpoint.
-    Load it using RGBTDetectionModel,
-    NOT directly using YOLO("best.pt").
+    IMPORTANT
+    ---------
+    best.pt is selected by validation mAP50-95, NOT val_loss.
+
+    Stored training state:
+        model
+        optimizer
+        scheduler
+        AMP scaler
+        best mAP50-95
+        best val loss (reference only)
+        early-stopping counter
+        stage information
+
+    This remains a YOLO-tcy custom checkpoint.
+    Load it using RGBTDetectionModel / this training script,
+    NOT directly with YOLO("best.pt").
     """
+
+    path = Path(
+        path
+    )
 
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
+    if stage_epoch is None:
+        stage_epoch = int(
+            epoch
+        )
+
+    if global_epoch is None:
+        global_epoch = int(
+            epoch
+        )
+
     checkpoint = {
+        # ----------------------------------------------------
+        # Epoch information
+        # ----------------------------------------------------
+
         "epoch":
-            epoch,
+            int(
+                stage_epoch
+            ),
+
+        "stage":
+            str(
+                stage
+            ),
+
+        "stage_epoch":
+            int(
+                stage_epoch
+            ),
+
+        "global_epoch":
+            int(
+                global_epoch
+            ),
+
+        # ----------------------------------------------------
+        # Model / optimizer state
+        # ----------------------------------------------------
 
         "model_state_dict":
             model.state_dict(),
@@ -535,8 +591,28 @@ def save_checkpoint(
         "scaler_state_dict":
             scaler.state_dict(),
 
+        # ----------------------------------------------------
+        # Model-selection / early-stop state
+        # ----------------------------------------------------
+
+        "best_map5095":
+            float(
+                best_map5095
+            ),
+
         "best_val_loss":
-            best_val_loss,
+            float(
+                best_val_loss
+            ),
+
+        "early_stop_counter":
+            int(
+                early_stop_counter
+            ),
+
+        # ----------------------------------------------------
+        # Experiment information
+        # ----------------------------------------------------
 
         "config":
             cfg,
@@ -561,7 +637,7 @@ def save_checkpoint(
 
 
 # ============================================================
-# 11. Load checkpoint
+# 11. Resume checkpoint
 # ============================================================
 
 def resume_checkpoint(
@@ -573,10 +649,21 @@ def resume_checkpoint(
     device,
 ):
     """
-    Resume training.
+    Resume a stage-1 or stage-2 training checkpoint.
+
+    Restores:
+        model
+        optimizer
+        scheduler
+        AMP scaler
+        best mAP50-95
+        early-stop counter
+        current stage / epoch
     """
 
-    path = Path(path)
+    path = Path(
+        path
+    )
 
     if not path.exists():
 
@@ -585,7 +672,20 @@ def resume_checkpoint(
         )
 
     print(
-        f"\nResume checkpoint:\n{path}"
+        "\n"
+        "============================================================"
+    )
+
+    print(
+        "Resume RGB-T checkpoint"
+    )
+
+    print(
+        "============================================================"
+    )
+
+    print(
+        f"Checkpoint     : {path}"
     )
 
     ckpt = torch.load(
@@ -594,38 +694,82 @@ def resume_checkpoint(
         weights_only=False,
     )
 
+    if (
+        "model_state_dict"
+        not in ckpt
+    ):
+
+        raise KeyError(
+            "Checkpoint 中没有 model_state_dict。"
+        )
+
     model.load_state_dict(
-        ckpt["model_state_dict"],
+        ckpt[
+            "model_state_dict"
+        ],
         strict=True,
     )
 
-    optimizer.load_state_dict(
-        ckpt[
-            "optimizer_state_dict"
-        ]
-    )
+    if (
+        "optimizer_state_dict"
+        in ckpt
+    ):
 
-    scheduler.load_state_dict(
-        ckpt[
-            "scheduler_state_dict"
-        ]
-    )
+        optimizer.load_state_dict(
+            ckpt[
+                "optimizer_state_dict"
+            ]
+        )
+
+    if (
+        "scheduler_state_dict"
+        in ckpt
+    ):
+
+        scheduler.load_state_dict(
+            ckpt[
+                "scheduler_state_dict"
+            ]
+        )
 
     if (
         "scaler_state_dict"
         in ckpt
     ):
+
         scaler.load_state_dict(
             ckpt[
                 "scaler_state_dict"
             ]
         )
 
-    start_epoch = (
-        int(
-            ckpt["epoch"]
+    resume_stage = str(
+        ckpt.get(
+            "stage",
+            "stage1",
         )
+    )
+
+    stage_epoch = int(
+        ckpt.get(
+            "stage_epoch",
+            ckpt.get(
+                "epoch",
+                -1,
+            ),
+        )
+    )
+
+    start_epoch = (
+        stage_epoch
         + 1
+    )
+
+    best_map5095 = float(
+        ckpt.get(
+            "best_map5095",
+            -1.0,
+        )
     )
 
     best_val_loss = float(
@@ -635,10 +779,206 @@ def resume_checkpoint(
         )
     )
 
-    return (
-        start_epoch,
-        best_val_loss,
+    early_stop_counter = int(
+        ckpt.get(
+            "early_stop_counter",
+            0,
+        )
     )
+
+    global_epoch = int(
+        ckpt.get(
+            "global_epoch",
+            stage_epoch,
+        )
+    )
+
+    print(
+        f"Stage          : {resume_stage}"
+    )
+
+    print(
+        f"Next stage ep. : {start_epoch + 1}"
+    )
+
+    print(
+        f"Best mAP50-95 : {best_map5095:.6f}"
+    )
+
+    print(
+        f"EarlyStop      : {early_stop_counter}"
+    )
+
+    print(
+        "============================================================\n"
+    )
+
+    return {
+        "stage":
+            resume_stage,
+
+        "start_epoch":
+            start_epoch,
+
+        "best_map5095":
+            best_map5095,
+
+        "best_val_loss":
+            best_val_loss,
+
+        "early_stop_counter":
+            early_stop_counter,
+
+        "global_epoch":
+            global_epoch,
+    }
+
+
+# ============================================================
+# 12. Load model weights only
+# ============================================================
+
+def load_weights_only(
+    path,
+    model,
+    device,
+):
+    """
+    Load ONLY model parameters from a checkpoint.
+
+    Used when entering stage 2.
+
+    Stage 2 intentionally DOES NOT inherit:
+        optimizer
+        scheduler
+        AMP scaler
+
+    These states are reinitialized so the fine-tuning stage
+    receives a fresh, lower-learning-rate schedule.
+    """
+
+    path = Path(
+        path
+    )
+
+    if not path.exists():
+
+        raise FileNotFoundError(
+            "\nStage-2 initialization checkpoint 不存在:\n"
+            f"{path}"
+        )
+
+    ckpt = torch.load(
+        path,
+        map_location=device,
+        weights_only=False,
+    )
+
+    if (
+        "model_state_dict"
+        not in ckpt
+    ):
+
+        raise KeyError(
+            "\nCheckpoint 中没有 model_state_dict。\n"
+        )
+
+    model.load_state_dict(
+        ckpt[
+            "model_state_dict"
+        ],
+        strict=True,
+    )
+
+    print(
+        "\n"
+        "============================================================"
+    )
+
+    print(
+        "Load best model for Stage 2 fine-tuning"
+    )
+
+    print(
+        "============================================================"
+    )
+
+    print(
+        f"Checkpoint     : {path}"
+    )
+
+    print(
+        "Model weights  : loaded"
+    )
+
+    print(
+        "Optimizer      : NEW"
+    )
+
+    print(
+        "Scheduler      : NEW"
+    )
+
+    print(
+        "AMP scaler     : NEW"
+    )
+
+    print(
+        "============================================================\n"
+    )
+
+    return ckpt
+
+
+# ============================================================
+# 13. History helper
+# ============================================================
+
+def load_existing_history(
+    path: Path,
+):
+    """
+    Load history.json when resuming an interrupted experiment.
+    """
+
+    path = Path(
+        path
+    )
+
+    if not path.exists():
+        return []
+
+    try:
+
+        with path.open(
+            "r",
+            encoding="utf-8",
+        ) as f:
+
+            history = json.load(
+                f
+            )
+
+        if isinstance(
+            history,
+            list,
+        ):
+
+            return history
+
+    except Exception as e:
+
+        print(
+            "WARNING: history.json 读取失败，"
+            "将从空 history 继续。"
+        )
+
+        print(
+            e
+        )
+
+    return []
+
 
 # ============================================================
 # Training progress utilities
@@ -1653,24 +1993,733 @@ def validate_metrics(
             total_instances,
     }
 # ============================================================
-# 14. Main training
+# 17. One complete training stage
 # ============================================================
 
-def train(cfg: Dict):
+def run_training_stage(
+    *,
+    stage_name: str,
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    scheduler,
+    scaler,
+    device,
+    amp: bool,
+    grad_clip: float,
+    epochs: int,
+    start_epoch: int,
+    patience: int,
+    min_delta: float,
+    rgb_imgsz: int,
+    tir_imgsz: int,
+    save_dir: Path,
+    weights_dir: Path,
+    cfg: Dict,
+    history: list,
+    best_map5095: float,
+    best_val_loss: float,
+    early_stop_counter: int = 0,
+    global_epoch_offset: int = 0,
+):
+    """
+    Train one stage.
+
+    Model selection:
+        validation mAP50-95
+
+    Early stopping:
+        stop when mAP50-95 has not improved for `patience`
+        consecutive epochs.
+
+    best.pt:
+        global best across both stages.
+
+    stage1_best.pt / stage2_best.pt:
+        stage-specific copies when a new GLOBAL best appears.
+    """
+
+    stage_name = str(
+        stage_name
+    )
+
+    epochs = int(
+        epochs
+    )
+
+    start_epoch = int(
+        start_epoch
+    )
+
+    patience = int(
+        patience
+    )
+
+    min_delta = float(
+        min_delta
+    )
+
+    early_stop_counter = int(
+        early_stop_counter
+    )
+
+    epochs_ran = 0
+
+    last_stage_epoch = (
+        start_epoch
+        - 1
+    )
+
+    last_global_epoch = (
+        global_epoch_offset
+        + last_stage_epoch
+    )
+
+    stopped_early = False
+
+    print(
+        "\n"
+        "############################################################"
+    )
+
+    print(
+        f"{stage_name.upper()} START"
+    )
+
+    print(
+        "############################################################"
+    )
+
+    print(
+        f"Max epochs       : {epochs}"
+    )
+
+    print(
+        f"Start epoch      : {start_epoch + 1}"
+    )
+
+    print(
+        f"Patience         : {patience}"
+    )
+
+    print(
+        f"Best mAP50-95    : {best_map5095:.6f}"
+    )
+
+    print(
+        f"EarlyStop count  : "
+        f"{early_stop_counter}/{patience}"
+    )
+
+    print(
+        "############################################################\n"
+    )
+
+    for stage_epoch in range(
+        start_epoch,
+        epochs,
+    ):
+
+        global_epoch = (
+            global_epoch_offset
+            + stage_epoch
+        )
+
+        # ====================================================
+        # Train
+        # ====================================================
+
+        (
+            train_loss,
+            train_loss_items,
+        ) = train_one_epoch(
+            model=model,
+
+            loader=train_loader,
+
+            optimizer=optimizer,
+
+            scaler=scaler,
+
+            device=device,
+
+            amp=amp,
+
+            grad_clip=grad_clip,
+
+            epoch=stage_epoch,
+
+            epochs=epochs,
+
+            rgb_imgsz=rgb_imgsz,
+
+            tir_imgsz=tir_imgsz,
+        )
+
+        # ====================================================
+        # Validation loss
+        # ====================================================
+
+        val_loss = validate_loss(
+            model=model,
+
+            loader=val_loader,
+
+            device=device,
+
+            amp=amp,
+
+            epoch=stage_epoch,
+
+            epochs=epochs,
+        )
+
+        # ====================================================
+        # Detection metrics
+        # ====================================================
+
+        val_metrics = validate_metrics(
+            model=model,
+
+            loader=val_loader,
+
+            device=device,
+
+            amp=amp,
+
+            conf_thres=0.001,
+
+            iou_thres=0.7,
+
+            max_det=300,
+        )
+
+        # ====================================================
+        # Scheduler
+        # ====================================================
+
+        scheduler.step()
+
+        current_lr = float(
+            optimizer.param_groups[
+                0
+            ][
+                "lr"
+            ]
+        )
+
+        (
+            train_box_loss,
+            train_cls_loss,
+            train_dfl_loss,
+        ) = get_standard_losses(
+            train_loss_items
+        )
+
+        current_map5095 = float(
+            val_metrics[
+                "map5095"
+            ]
+        )
+
+        current_map50 = float(
+            val_metrics[
+                "map50"
+            ]
+        )
+
+        current_map75 = float(
+            val_metrics[
+                "map75"
+            ]
+        )
+
+        current_precision = float(
+            val_metrics[
+                "precision"
+            ]
+        )
+
+        current_recall = float(
+            val_metrics[
+                "recall"
+            ]
+        )
+
+        best_val_loss = min(
+            float(
+                best_val_loss
+            ),
+            float(
+                val_loss
+            ),
+        )
+
+        # ====================================================
+        # mAP-based best model + early stopping
+        # ====================================================
+
+        map_improved = (
+            current_map5095
+            >
+            (
+                best_map5095
+                + min_delta
+            )
+        )
+
+        if map_improved:
+
+            best_map5095 = (
+                current_map5095
+            )
+
+            early_stop_counter = 0
+
+            # -----------------------------------------------
+            # Global best.pt
+            # -----------------------------------------------
+
+            save_checkpoint(
+                weights_dir
+                / "best.pt",
+
+                model=model,
+
+                optimizer=optimizer,
+
+                scheduler=scheduler,
+
+                scaler=scaler,
+
+                epoch=stage_epoch,
+
+                best_map5095=best_map5095,
+
+                cfg=cfg,
+
+                stage=stage_name,
+
+                stage_epoch=stage_epoch,
+
+                global_epoch=global_epoch,
+
+                best_val_loss=best_val_loss,
+
+                early_stop_counter=(
+                    early_stop_counter
+                ),
+            )
+
+            # -----------------------------------------------
+            # Stage-specific best copy
+            # -----------------------------------------------
+
+            save_checkpoint(
+                weights_dir
+                / f"{stage_name}_best.pt",
+
+                model=model,
+
+                optimizer=optimizer,
+
+                scheduler=scheduler,
+
+                scaler=scaler,
+
+                epoch=stage_epoch,
+
+                best_map5095=best_map5095,
+
+                cfg=cfg,
+
+                stage=stage_name,
+
+                stage_epoch=stage_epoch,
+
+                global_epoch=global_epoch,
+
+                best_val_loss=best_val_loss,
+
+                early_stop_counter=(
+                    early_stop_counter
+                ),
+            )
+
+        else:
+
+            early_stop_counter += 1
+
+        # ====================================================
+        # History
+        # ====================================================
+
+        record = {
+            "stage":
+                stage_name,
+
+            "stage_epoch":
+                stage_epoch + 1,
+
+            "global_epoch":
+                global_epoch + 1,
+
+            "train_loss":
+                float(
+                    train_loss
+                ),
+
+            "box_loss":
+                float(
+                    train_box_loss
+                ),
+
+            "cls_loss":
+                float(
+                    train_cls_loss
+                ),
+
+            "dfl_loss":
+                float(
+                    train_dfl_loss
+                ),
+
+            "val_loss":
+                float(
+                    val_loss
+                ),
+
+            "precision":
+                current_precision,
+
+            "recall":
+                current_recall,
+
+            "map50":
+                current_map50,
+
+            "map75":
+                current_map75,
+
+            "map5095":
+                current_map5095,
+
+            "best_map5095":
+                float(
+                    best_map5095
+                ),
+
+            "early_stop_counter":
+                int(
+                    early_stop_counter
+                ),
+
+            "patience":
+                int(
+                    patience
+                ),
+
+            "lr":
+                current_lr,
+        }
+
+        history.append(
+            record
+        )
+
+        history_path = (
+            save_dir
+            / "history.json"
+        )
+
+        with history_path.open(
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            json.dump(
+                history,
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        # ====================================================
+        # last.pt
+        # ====================================================
+
+        save_checkpoint(
+            weights_dir
+            / "last.pt",
+
+            model=model,
+
+            optimizer=optimizer,
+
+            scheduler=scheduler,
+
+            scaler=scaler,
+
+            epoch=stage_epoch,
+
+            best_map5095=best_map5095,
+
+            cfg=cfg,
+
+            stage=stage_name,
+
+            stage_epoch=stage_epoch,
+
+            global_epoch=global_epoch,
+
+            best_val_loss=best_val_loss,
+
+            early_stop_counter=(
+                early_stop_counter
+            ),
+        )
+
+        save_checkpoint(
+            weights_dir
+            / f"{stage_name}_last.pt",
+
+            model=model,
+
+            optimizer=optimizer,
+
+            scheduler=scheduler,
+
+            scaler=scaler,
+
+            epoch=stage_epoch,
+
+            best_map5095=best_map5095,
+
+            cfg=cfg,
+
+            stage=stage_name,
+
+            stage_epoch=stage_epoch,
+
+            global_epoch=global_epoch,
+
+            best_val_loss=best_val_loss,
+
+            early_stop_counter=(
+                early_stop_counter
+            ),
+        )
+
+        # ====================================================
+        # Epoch summary
+        # ====================================================
+
+        print(
+            "\n"
+            f"{stage_name} "
+            f"Epoch {stage_epoch + 1}/{epochs} finished:"
+        )
+
+        print(
+            f"  train_loss     = "
+            f"{train_loss:.6f}"
+        )
+
+        print(
+            f"  box_loss       = "
+            f"{train_box_loss:.6f}"
+        )
+
+        print(
+            f"  cls_loss       = "
+            f"{train_cls_loss:.6f}"
+        )
+
+        print(
+            f"  dfl_loss       = "
+            f"{train_dfl_loss:.6f}"
+        )
+
+        print(
+            f"  val_loss       = "
+            f"{val_loss:.6f}"
+        )
+
+        print(
+            f"  precision      = "
+            f"{current_precision:.4f}"
+        )
+
+        print(
+            f"  recall         = "
+            f"{current_recall:.4f}"
+        )
+
+        print(
+            f"  mAP50          = "
+            f"{current_map50:.4f}"
+        )
+
+        print(
+            f"  mAP75          = "
+            f"{current_map75:.4f}"
+        )
+
+        print(
+            f"  mAP50-95       = "
+            f"{current_map5095:.4f}"
+        )
+
+        print(
+            f"  best mAP50-95  = "
+            f"{best_map5095:.4f}"
+        )
+
+        print(
+            f"  EarlyStop      = "
+            f"{early_stop_counter}/{patience}"
+        )
+
+        print(
+            f"  lr             = "
+            f"{current_lr:.8f}"
+        )
+
+        if map_improved:
+
+            print(
+                "  [BEST] "
+                f"mAP50-95="
+                f"{best_map5095:.6f}"
+            )
+
+        # ====================================================
+        # Bookkeeping
+        # ====================================================
+
+        epochs_ran += 1
+
+        last_stage_epoch = (
+            stage_epoch
+        )
+
+        last_global_epoch = (
+            global_epoch
+        )
+
+        # ====================================================
+        # Early stopping
+        # ====================================================
+
+        if (
+            patience > 0
+            and early_stop_counter
+            >= patience
+        ):
+
+            stopped_early = True
+
+            print(
+                "\n"
+                "============================================================"
+            )
+
+            print(
+                f"{stage_name} EARLY STOPPING"
+            )
+
+            print(
+                "============================================================"
+            )
+
+            print(
+                f"No mAP50-95 improvement for "
+                f"{patience} consecutive epochs."
+            )
+
+            print(
+                f"Best mAP50-95 : "
+                f"{best_map5095:.6f}"
+            )
+
+            print(
+                f"Stopped at     : "
+                f"{stage_epoch + 1}/{epochs}"
+            )
+
+            print(
+                "============================================================\n"
+            )
+
+            break
+
+    return {
+        "best_map5095":
+            float(
+                best_map5095
+            ),
+
+        "best_val_loss":
+            float(
+                best_val_loss
+            ),
+
+        "early_stop_counter":
+            int(
+                early_stop_counter
+            ),
+
+        "epochs_ran":
+            int(
+                epochs_ran
+            ),
+
+        "last_stage_epoch":
+            int(
+                last_stage_epoch
+            ),
+
+        "last_global_epoch":
+            int(
+                last_global_epoch
+            ),
+
+        "stopped_early":
+            bool(
+                stopped_early
+            ),
+
+        "history":
+            history,
+    }
+
+
+# ============================================================
+# 18. Main training
+# ============================================================
+
+def train(
+    cfg: Dict,
+):
 
     # ========================================================
     # Basic settings
     # ========================================================
 
     seed = int(
-        cfg["train"].get(
+        cfg[
+            "train"
+        ].get(
             "seed",
             0,
         )
     )
 
     deterministic = bool(
-        cfg["train"].get(
+        cfg[
+            "train"
+        ].get(
             "deterministic",
             True,
         )
@@ -1683,7 +2732,9 @@ def train(cfg: Dict):
 
     device = select_device(
         str(
-            cfg["train"].get(
+            cfg[
+                "train"
+            ].get(
                 "device",
                 "0",
             )
@@ -1696,7 +2747,7 @@ def train(cfg: Dict):
     )
 
     print(
-        "RGB-T YOLO Training"
+        "RGB-T YOLO Two-Stage Training"
     )
 
     print(
@@ -1719,20 +2770,29 @@ def train(cfg: Dict):
     # ========================================================
 
     project = Path(
-        cfg["output"].get(
+        cfg[
+            "output"
+        ].get(
             "project",
-            ROOT / "runs/rgbt",
+            ROOT
+            / "runs/rgbt",
         )
     )
 
     if not project.is_absolute():
-        project = ROOT / project
 
-    run_name = cfg[
-        "output"
-    ].get(
-        "name",
-        "rgbt_exp",
+        project = (
+            ROOT
+            / project
+        )
+
+    run_name = (
+        cfg[
+            "output"
+        ].get(
+            "name",
+            "rgbt_exp",
+        )
     )
 
     save_dir = (
@@ -1749,6 +2809,157 @@ def train(cfg: Dict):
         parents=True,
         exist_ok=True,
     )
+
+    # ========================================================
+    # Training-stage settings
+    #
+    # Defaults required by this project:
+    #     Stage 1 = 300 epochs
+    #     Stage 2 = 200 epochs
+    #     patience = 50
+    # ========================================================
+
+    train_cfg = cfg[
+        "train"
+    ]
+
+    stage1_epochs = int(
+        train_cfg.get(
+            "epochs",
+            300,
+        )
+    )
+
+    patience = int(
+        train_cfg.get(
+            "patience",
+            50,
+        )
+    )
+
+    min_delta = float(
+        train_cfg.get(
+            "early_stop_min_delta",
+            1e-6,
+        )
+    )
+
+    stage2_user_cfg = (
+        train_cfg.get(
+            "stage2",
+            {},
+        )
+        or {}
+    )
+
+    stage2_enabled = bool(
+        stage2_user_cfg.get(
+            "enabled",
+            True,
+        )
+    )
+
+    stage2_epochs = int(
+        stage2_user_cfg.get(
+            "epochs",
+            200,
+        )
+    )
+
+    stage1_lr0 = float(
+        train_cfg.get(
+            "lr0",
+            0.01,
+        )
+    )
+
+    stage2_lr0 = float(
+        stage2_user_cfg.get(
+            "lr0",
+            stage1_lr0
+            * 0.1,
+        )
+    )
+
+    stage2_lrf = float(
+        stage2_user_cfg.get(
+            "lrf",
+            train_cfg.get(
+                "lrf",
+                0.01,
+            ),
+        )
+    )
+
+    stage2_patience = int(
+        stage2_user_cfg.get(
+            "patience",
+            patience,
+        )
+    )
+
+    stage2_min_delta = float(
+        stage2_user_cfg.get(
+            "early_stop_min_delta",
+            min_delta,
+        )
+    )
+
+    # Store effective defaults in saved config.
+    cfg.setdefault(
+        "train",
+        {}
+    )
+
+    cfg[
+        "train"
+    ][
+        "epochs"
+    ] = (
+        stage1_epochs
+    )
+
+    cfg[
+        "train"
+    ][
+        "patience"
+    ] = (
+        patience
+    )
+
+    cfg[
+        "train"
+    ][
+        "early_stop_min_delta"
+    ] = (
+        min_delta
+    )
+
+    cfg[
+        "train"
+    ][
+        "stage2"
+    ] = {
+        **stage2_user_cfg,
+
+        "enabled":
+            stage2_enabled,
+
+        "epochs":
+            stage2_epochs,
+
+        "lr0":
+            stage2_lr0,
+
+        "lrf":
+            stage2_lrf,
+
+        "patience":
+            stage2_patience,
+
+        "early_stop_min_delta":
+            stage2_min_delta,
+    }
 
     save_config(
         cfg,
@@ -1808,7 +3019,7 @@ def train(cfg: Dict):
     )
 
     # ========================================================
-    # Train dataset
+    # Datasets
     # ========================================================
 
     train_dataset = (
@@ -1828,14 +3039,18 @@ def train(cfg: Dict):
             augment=True,
 
             fliplr=float(
-                cfg["augment"].get(
+                cfg[
+                    "augment"
+                ].get(
                     "fliplr",
                     0.5,
                 )
             ),
 
             flipud=float(
-                cfg["augment"].get(
+                cfg[
+                    "augment"
+                ].get(
                     "flipud",
                     0.0,
                 )
@@ -1846,10 +3061,6 @@ def train(cfg: Dict):
             strict_pair=True,
         )
     )
-
-    # ========================================================
-    # Validation dataset
-    # ========================================================
 
     val_dataset = (
         build_rgbt_dataset(
@@ -1874,14 +3085,14 @@ def train(cfg: Dict):
     )
 
     batch_size = int(
-        cfg["train"].get(
+        train_cfg.get(
             "batch",
             8,
         )
     )
 
     workers = int(
-        cfg["train"].get(
+        train_cfg.get(
             "workers",
             4,
         )
@@ -1971,28 +3182,67 @@ def train(cfg: Dict):
     model.print_info()
 
     # ========================================================
-    # Optimizer
+    # Common training parameters
     # ========================================================
+
+    amp = bool(
+        train_cfg.get(
+            "amp",
+            True,
+        )
+    )
+
+    grad_clip = float(
+        train_cfg.get(
+            "grad_clip",
+            10.0,
+        )
+    )
+
+    resume = train_cfg.get(
+        "resume",
+        None,
+    )
+
+    history = (
+        load_existing_history(
+            save_dir
+            / "history.json"
+        )
+        if resume
+        else []
+    )
+
+    best_map5095 = -1.0
+
+    best_val_loss = float(
+        "inf"
+    )
+
+    # ========================================================
+    # Stage 1 optimizer / scheduler / scaler
+    # ========================================================
+
+    stage1_cfg = copy.deepcopy(
+        cfg
+    )
+
+    stage1_cfg[
+        "train"
+    ][
+        "epochs"
+    ] = (
+        stage1_epochs
+    )
 
     optimizer = build_optimizer(
         model,
-        cfg,
+        stage1_cfg,
     )
 
     scheduler = build_scheduler(
         optimizer,
-        cfg,
-    )
-
-    # ========================================================
-    # AMP
-    # ========================================================
-
-    amp = bool(
-        cfg["train"].get(
-            "amp",
-            True,
-        )
+        stage1_cfg,
     )
 
     scaler = build_scaler(
@@ -2001,375 +3251,16 @@ def train(cfg: Dict):
     )
 
     # ========================================================
-    # Resume
+    # Resume state
     # ========================================================
 
-    start_epoch = 0
-
-    best_val_loss = float(
-        "inf"
-    )
-
-    resume = cfg[
-        "train"
-    ].get(
-        "resume",
-        None,
-    )
+    resume_state = None
 
     if resume:
 
-        (
-            start_epoch,
-            best_val_loss,
-        ) = resume_checkpoint(
-            resume,
-
-            model,
-
-            optimizer,
-
-            scheduler,
-
-            scaler,
-
-            device,
-        )
-
-    # ========================================================
-    # Training parameters
-    # ========================================================
-
-    epochs = int(
-        cfg["train"].get(
-            "epochs",
-            300,
-        )
-    )
-
-    grad_clip = float(
-        cfg["train"].get(
-            "grad_clip",
-            10.0,
-        )
-    )
-
-    print(
-        f"Epochs        : {epochs}"
-    )
-
-    print(
-        f"Batch         : {batch_size}"
-    )
-
-    print(
-        f"Workers       : {workers}"
-    )
-
-    print(
-        f"Optimizer     : "
-        f"{cfg['train'].get('optimizer', 'SGD')}"
-    )
-
-    print(
-        f"AMP           : {amp}"
-    )
-
-    print(
-        f"Save dir      : {save_dir}"
-    )
-
-    print(
-        "============================================================\n"
-    )
-
-    # ========================================================
-    # Training loop
-    # ========================================================
-
-    history = []
-
-    for epoch in range(
-        start_epoch,
-        epochs,
-    ):
-
-        print(
-            "\n"
-            "############################################################"
-        )
-
-        print(
-            f"Epoch "
-            f"{epoch + 1}/{epochs}"
-        )
-
-        print(
-            "############################################################"
-        )
-
-        # ----------------------------------------------------
-        # Train
-        # ----------------------------------------------------
-
-        (
-            train_loss,
-            train_loss_items,
-        ) = train_one_epoch(
-            model=model,
-
-            loader=train_loader,
-
-            optimizer=optimizer,
-
-            scaler=scaler,
-
-            device=device,
-
-            amp=amp,
-
-            grad_clip=grad_clip,
-
-            epoch=epoch,
-
-            epochs=epochs,
-
-            rgb_imgsz=rgb_imgsz,
-
-            tir_imgsz=tir_imgsz,
-        )
-
-        # ----------------------------------------------------
-        # Validation
-        # ----------------------------------------------------
-
-        # ----------------------------------------------------
-        # Validation loss
-        # ----------------------------------------------------
-
-        val_loss = validate_loss(
-            model=model,
-
-            loader=val_loader,
-
-            device=device,
-
-            amp=amp,
-
-            epoch=epoch,
-
-            epochs=epochs,
-        )
-
-
-        # ----------------------------------------------------
-        # Validation detection metrics
-        #
-        # Same metric pipeline as val_rgbt.py
-        # ----------------------------------------------------
-
-        val_metrics = validate_metrics(
-            model=model,
-
-            loader=val_loader,
-
-            device=device,
-
-            amp=amp,
-
-            conf_thres=0.001,
-
-            iou_thres=0.7,
-
-            max_det=300,
-        )
-
-        # ----------------------------------------------------
-        # LR
-        # ----------------------------------------------------
-
-        scheduler.step()
-
-        current_lr = (
-            optimizer.param_groups[
-                0
-            ]["lr"]
-        )
-
-        print(
-            "\n"
-            f"Epoch {epoch + 1} finished:"
-        )
-
-        (
-            train_box_loss,
-            train_cls_loss,
-            train_dfl_loss,
-        ) = get_standard_losses(
-            train_loss_items
-        )
-
-        print(
-            f"  train_loss = "
-            f"{train_loss:.6f}"
-        )
-
-        print(
-            f"  box_loss   = "
-            f"{train_box_loss:.6f}"
-        )
-
-        print(
-            f"  cls_loss   = "
-            f"{train_cls_loss:.6f}"
-        )
-
-        print(
-            f"  dfl_loss   = "
-            f"{train_dfl_loss:.6f}"
-        )
-
-        print(
-            f"  val_loss   = "
-            f"{val_loss:.6f}"
-        )
-
-        print(
-            f"  lr         = "
-            f"{current_lr:.8f}"
-        )
-
-        print(
-            f"  precision  = "
-            f"{val_metrics['precision']:.4f}"
-        )
-
-        print(
-            f"  recall     = "
-            f"{val_metrics['recall']:.4f}"
-        )
-
-        print(
-            f"  mAP50      = "
-            f"{val_metrics['map50']:.4f}"
-        )
-
-        print(
-            f"  mAP75      = "
-            f"{val_metrics['map75']:.4f}"
-        )
-
-        print(
-            f"  mAP50-95   = "
-            f"{val_metrics['map5095']:.4f}"
-        )
-
-        # ----------------------------------------------------
-        # History
-        # ----------------------------------------------------
-
-        record = {
-            "epoch":
-                epoch + 1,
-
-            "train_loss":
-                train_loss,
-
-            "box_loss":
-                train_box_loss,
-
-            "cls_loss":
-                train_cls_loss,
-
-            "dfl_loss":
-                train_dfl_loss,
-
-            "val_loss":
-                val_loss,
-
-            "precision":
-                val_metrics[
-                    "precision"
-                ],
-
-            "recall":
-                val_metrics[
-                    "recall"
-                ],
-
-            "map50":
-                val_metrics[
-                    "map50"
-                ],
-
-            "map75":
-                val_metrics[
-                    "map75"
-                ],
-
-            "map5095":
-                val_metrics[
-                    "map5095"
-                ],
-
-            "lr":
-                current_lr,
-        }
-
-        history.append(
-            record
-        )
-
-        with (
-            save_dir
-            / "history.json"
-        ).open(
-            "w",
-            encoding="utf-8",
-        ) as f:
-
-            json.dump(
-                history,
-                f,
-                indent=2,
-            )
-
-        # ----------------------------------------------------
-        # last.pt
-        # ----------------------------------------------------
-
-        save_checkpoint(
-            weights_dir
-            / "last.pt",
-
-            model,
-
-            optimizer,
-
-            scheduler,
-
-            scaler,
-
-            epoch,
-
-            best_val_loss,
-
-            cfg,
-        )
-
-        # ----------------------------------------------------
-        # best.pt
-        # ----------------------------------------------------
-
-        if val_loss < best_val_loss:
-
-            best_val_loss = (
-                val_loss
-            )
-
-            save_checkpoint(
-                weights_dir
-                / "best.pt",
+        resume_state = (
+            resume_checkpoint(
+                resume,
 
                 model,
 
@@ -2379,17 +3270,25 @@ def train(cfg: Dict):
 
                 scaler,
 
-                epoch,
-
-                best_val_loss,
-
-                cfg,
+                device,
             )
+        )
 
-            print(
-                f"  [BEST] "
-                f"val_loss={best_val_loss:.6f}"
-            )
+        best_map5095 = (
+            resume_state[
+                "best_map5095"
+            ]
+        )
+
+        best_val_loss = (
+            resume_state[
+                "best_val_loss"
+            ]
+        )
+
+    # ========================================================
+    # Summary
+    # ========================================================
 
     print(
         "\n"
@@ -2397,7 +3296,502 @@ def train(cfg: Dict):
     )
 
     print(
-        "Training completed."
+        "Two-stage training configuration"
+    )
+
+    print(
+        "============================================================"
+    )
+
+    print(
+        f"Stage 1 epochs : "
+        f"{stage1_epochs}"
+    )
+
+    print(
+        f"Stage 1 lr0    : "
+        f"{stage1_lr0}"
+    )
+
+    print(
+        f"Stage 2 enabled: "
+        f"{stage2_enabled}"
+    )
+
+    print(
+        f"Stage 2 epochs : "
+        f"{stage2_epochs}"
+    )
+
+    print(
+        f"Stage 2 lr0    : "
+        f"{stage2_lr0}"
+    )
+
+    print(
+        f"Patience       : "
+        f"{patience}"
+    )
+
+    print(
+        f"Selection      : "
+        "mAP50-95"
+    )
+
+    print(
+        f"Batch          : "
+        f"{batch_size}"
+    )
+
+    print(
+        f"Workers        : "
+        f"{workers}"
+    )
+
+    print(
+        f"Optimizer      : "
+        f"{train_cfg.get('optimizer', 'SGD')}"
+    )
+
+    print(
+        f"AMP            : "
+        f"{amp}"
+    )
+
+    print(
+        f"Save dir       : "
+        f"{save_dir}"
+    )
+
+    print(
+        "============================================================\n"
+    )
+
+    # ========================================================
+    # Decide resume stage
+    # ========================================================
+
+    resume_stage = (
+        resume_state[
+            "stage"
+        ]
+        if resume_state
+        is not None
+        else "stage1"
+    )
+
+    # ========================================================
+    # Stage 1
+    # ========================================================
+
+    stage1_result = None
+
+    if resume_stage == "stage1":
+
+        stage1_start_epoch = (
+            resume_state[
+                "start_epoch"
+            ]
+            if resume_state
+            is not None
+            else 0
+        )
+
+        stage1_counter = (
+            resume_state[
+                "early_stop_counter"
+            ]
+            if resume_state
+            is not None
+            else 0
+        )
+
+        stage1_result = run_training_stage(
+            stage_name="stage1",
+
+            model=model,
+
+            train_loader=train_loader,
+
+            val_loader=val_loader,
+
+            optimizer=optimizer,
+
+            scheduler=scheduler,
+
+            scaler=scaler,
+
+            device=device,
+
+            amp=amp,
+
+            grad_clip=grad_clip,
+
+            epochs=stage1_epochs,
+
+            start_epoch=stage1_start_epoch,
+
+            patience=patience,
+
+            min_delta=min_delta,
+
+            rgb_imgsz=rgb_imgsz,
+
+            tir_imgsz=tir_imgsz,
+
+            save_dir=save_dir,
+
+            weights_dir=weights_dir,
+
+            cfg=cfg,
+
+            history=history,
+
+            best_map5095=best_map5095,
+
+            best_val_loss=best_val_loss,
+
+            early_stop_counter=(
+                stage1_counter
+            ),
+
+            global_epoch_offset=0,
+        )
+
+        best_map5095 = (
+            stage1_result[
+                "best_map5095"
+            ]
+        )
+
+        best_val_loss = (
+            stage1_result[
+                "best_val_loss"
+            ]
+        )
+
+        history = (
+            stage1_result[
+                "history"
+            ]
+        )
+
+        stage1_last_global_epoch = (
+            stage1_result[
+                "last_global_epoch"
+            ]
+        )
+
+    else:
+
+        # Resuming an already-running stage 2 checkpoint.
+        stage1_last_global_epoch = (
+            max(
+                resume_state[
+                    "global_epoch"
+                ]
+                - resume_state[
+                    "start_epoch"
+                ],
+                -1,
+            )
+        )
+
+    # ========================================================
+    # Stop here when Stage 2 is disabled
+    # ========================================================
+
+    if not stage2_enabled:
+
+        print(
+            "\nStage 2 disabled."
+        )
+
+        print(
+            f"Best mAP50-95 : "
+            f"{best_map5095:.6f}"
+        )
+
+        print(
+            f"Best weight   : "
+            f"{weights_dir / 'best.pt'}"
+        )
+
+        return
+
+    # ========================================================
+    # Stage 2 configuration
+    #
+    # Fresh optimizer / scheduler / scaler.
+    # ========================================================
+
+    stage2_cfg = copy.deepcopy(
+        cfg
+    )
+
+    stage2_cfg[
+        "train"
+    ][
+        "epochs"
+    ] = (
+        stage2_epochs
+    )
+
+    stage2_cfg[
+        "train"
+    ][
+        "lr0"
+    ] = (
+        stage2_lr0
+    )
+
+    stage2_cfg[
+        "train"
+    ][
+        "lrf"
+    ] = (
+        stage2_lrf
+    )
+
+    if (
+        "optimizer"
+        in stage2_user_cfg
+    ):
+
+        stage2_cfg[
+            "train"
+        ][
+            "optimizer"
+        ] = (
+            stage2_user_cfg[
+                "optimizer"
+            ]
+        )
+
+    if (
+        "momentum"
+        in stage2_user_cfg
+    ):
+
+        stage2_cfg[
+            "train"
+        ][
+            "momentum"
+        ] = (
+            stage2_user_cfg[
+                "momentum"
+            ]
+        )
+
+    if (
+        "weight_decay"
+        in stage2_user_cfg
+    ):
+
+        stage2_cfg[
+            "train"
+        ][
+            "weight_decay"
+        ] = (
+            stage2_user_cfg[
+                "weight_decay"
+            ]
+        )
+
+    # ========================================================
+    # Stage 2 resume
+    # ========================================================
+
+    if resume_stage == "stage2":
+
+        # The currently loaded model / optimizer / scheduler /
+        # scaler already came from the stage-2 checkpoint.
+        stage2_optimizer = optimizer
+
+        stage2_scheduler = scheduler
+
+        stage2_scaler = scaler
+
+        stage2_start_epoch = (
+            resume_state[
+                "start_epoch"
+            ]
+        )
+
+        stage2_counter = (
+            resume_state[
+                "early_stop_counter"
+            ]
+        )
+
+        stage2_global_offset = (
+            resume_state[
+                "global_epoch"
+            ]
+            - (
+                resume_state[
+                    "start_epoch"
+                ]
+                - 1
+            )
+        )
+
+    else:
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # Start stage 2 from the BEST stage-1 mAP checkpoint,
+        # not from stage1_last.pt.
+        # ----------------------------------------------------
+
+        stage1_best_path = (
+            weights_dir
+            / "stage1_best.pt"
+        )
+
+        if not stage1_best_path.exists():
+
+            stage1_best_path = (
+                weights_dir
+                / "best.pt"
+            )
+
+        load_weights_only(
+            stage1_best_path,
+
+            model,
+
+            device,
+        )
+
+        # Reconfigure loss in case model mode/state changed.
+        configure_model_loss(
+            model,
+            stage2_cfg,
+        )
+
+        stage2_optimizer = (
+            build_optimizer(
+                model,
+                stage2_cfg,
+            )
+        )
+
+        stage2_scheduler = (
+            build_scheduler(
+                stage2_optimizer,
+                stage2_cfg,
+            )
+        )
+
+        stage2_scaler = (
+            build_scaler(
+                amp,
+                device,
+            )
+        )
+
+        stage2_start_epoch = 0
+
+        # Patience restarts at stage 2, while the metric
+        # baseline remains the global stage-1 best.
+        stage2_counter = 0
+
+        stage2_global_offset = (
+            stage1_last_global_epoch
+            + 1
+        )
+
+    # ========================================================
+    # Stage 2
+    # ========================================================
+
+    stage2_result = run_training_stage(
+        stage_name="stage2",
+
+        model=model,
+
+        train_loader=train_loader,
+
+        val_loader=val_loader,
+
+        optimizer=stage2_optimizer,
+
+        scheduler=stage2_scheduler,
+
+        scaler=stage2_scaler,
+
+        device=device,
+
+        amp=amp,
+
+        grad_clip=grad_clip,
+
+        epochs=stage2_epochs,
+
+        start_epoch=stage2_start_epoch,
+
+        patience=stage2_patience,
+
+        min_delta=stage2_min_delta,
+
+        rgb_imgsz=rgb_imgsz,
+
+        tir_imgsz=tir_imgsz,
+
+        save_dir=save_dir,
+
+        weights_dir=weights_dir,
+
+        cfg=cfg,
+
+        history=history,
+
+        best_map5095=best_map5095,
+
+        best_val_loss=best_val_loss,
+
+        early_stop_counter=(
+            stage2_counter
+        ),
+
+        global_epoch_offset=(
+            stage2_global_offset
+        ),
+    )
+
+    best_map5095 = (
+        stage2_result[
+            "best_map5095"
+        ]
+    )
+
+    best_val_loss = (
+        stage2_result[
+            "best_val_loss"
+        ]
+    )
+
+    # ========================================================
+    # Final
+    # ========================================================
+
+    print(
+        "\n"
+        "============================================================"
+    )
+
+    print(
+        "Two-stage training completed."
+    )
+
+    print(
+        "============================================================"
+    )
+
+    print(
+        f"Best mAP50-95 : "
+        f"{best_map5095:.6f}"
     )
 
     print(
@@ -2411,12 +3805,17 @@ def train(cfg: Dict):
     )
 
     print(
+        f"Last weight   : "
+        f"{weights_dir / 'last.pt'}"
+    )
+
+    print(
         "============================================================"
     )
 
 
 # ============================================================
-# 15. CLI
+# 19. CLI
 # ============================================================
 
 if __name__ == "__main__":
