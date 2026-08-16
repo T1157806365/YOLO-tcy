@@ -6,7 +6,7 @@ model:
   pretrained: true
 
   # concat / add / weighted
-  fusion: concat
+  fusion: har
 
   # nearest / bilinear
   align_mode: bilinear
@@ -29,7 +29,7 @@ data:
 # ============================================================
 train:
   epochs: 300
-  batch: 24
+  batch: 4
   workers: 4
   device: 5
   optimizer: SGD
@@ -72,4 +72,4 @@ loss:
 # ============================================================
 output:
   project: runs/rgbt
-  name: yolo26n_uavcb_rgbt_concat_640_b24_seed0
+  name: yolo26n_uavcb_rgbt_har_640_b4_seed0

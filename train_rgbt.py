@@ -8,16 +8,7 @@ RGB -> Backbone-R ---\
                       -> Feature Fusion -> YOLO Neck -> Detect -> RGB GT
 TIR -> Backbone-T ---/
 
-Current baseline:
-    - Two independent YOLO backbones
-    - Both initialized from pretrained YOLO weights
-    - RGB/TIR can use different input resolutions
-    - P3/P4/P5 feature-level fusion
-    - Main detection loss uses RGB labels
-    - TIR labels are retained for future auxiliary supervision
-
 Project:
-    /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
 
     训练
     conda activate tcy
@@ -28,10 +19,9 @@ Project:
     conda activate tcy
     cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
     python train_rgbt.py \
-    --cfg configs/experiments/uavcb_rgbt_yolo26n_640.yaml
+    --cfg configs/experiments/uavcb-har-test.yaml
 """
 from __future__ import annotations
-
 import argparse
 import copy
 import json
@@ -42,7 +32,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict
-
 import numpy as np
 import torch
 import yaml
@@ -1191,6 +1180,8 @@ def get_standard_losses(
         [
             "dfl_loss",
             "dfl",
+            "l1_loss",
+            "l1",
         ]
     )
 

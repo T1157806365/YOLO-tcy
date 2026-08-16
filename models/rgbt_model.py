@@ -87,7 +87,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 from utils.config import resolve_model
-
+from models.modules.hra_fusion import (
+    HRAFusion,
+)
 
 # ============================================================
 # 1. Basic Conv block
@@ -462,6 +464,19 @@ def build_fusion_module(
             align_mode=align_mode,
         )
 
+    if fusion == "hra":
+        return HRAFusion(
+            rgb_channels=rgb_channels,
+
+            tir_channels=tir_channels,
+
+            out_channels=rgb_channels,
+
+            align_mode=align_mode,
+
+            max_offset=0.10,
+        )
+    
     raise ValueError(
         "\n不支持 fusion:\n"
         f"{fusion}\n\n"
