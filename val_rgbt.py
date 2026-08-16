@@ -31,16 +31,17 @@ Current main GT:
 Current task:
     UAV-only detection
 
+    conda activate tcy
     cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
     python val_rgbt.py \
-    --weights runs/rgbt/yolo26n_LRDDv3_rgbt_concat_640_seed0/weights/best.pt \
-    --rgb /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/NewDataset-RGB.yaml \
-    --tir /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/NewDataset-TIR.yaml \
+    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rgbt/yolo26n_LRDDv3_rgbt_concat_640_b24_seed0/weights/best.pt \
+    --rgb /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/LRDD_v3-RGB.yaml \
+    --tir /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/LRDD_v3-TIR.yaml \
     --split val \
     --rgb-imgsz 640 \
     --tir-imgsz 640 \
     --batch 4 \
-    --device 3
+    --device 0
 """
 
 from __future__ import annotations
@@ -602,31 +603,54 @@ def get_model_complexity(
 
 def postprocess_predictions(
     preds,
-
     model: torch.nn.Module,
-
     conf_thres: float,
-
     iou_thres: float,
-
     max_det: int,
 ):
     """
-    Ultralytics-style NMS.
+    Postprocess RGB-T YOLO predictions.
 
-    Returns
-    -------
-    list[dict]
+    Supports:
+        YOLO26 end-to-end:
+            output [B, 300, 6]
+            xyxy + conf + cls
+            NO traditional NMS
 
-    Each dict:
-        bboxes: [N,4] xyxy
-        conf:   [N]
-        cls:    [N]
+        YOLO11 / non-end2end:
+            traditional YOLO output
+            requires NMS
     """
 
-    # --------------------------------------------------------
-    # Custom wrapper safety
-    # --------------------------------------------------------
+    # ========================================================
+    # 1. Unwrap model output
+    #
+    # YOLO26 eval mode commonly returns:
+    #
+    #     (
+    #         y,          # [B, 300, 6]
+    #         raw_preds
+    #     )
+    #
+    # We need y.
+    # ========================================================
+
+    if isinstance(
+        preds,
+        (tuple, list),
+    ):
+
+        if len(preds) == 0:
+
+            raise RuntimeError(
+                "模型输出 tuple/list 为空。"
+            )
+
+        preds = preds[0]
+
+    # ========================================================
+    # 2. Dict wrapper
+    # ========================================================
 
     if isinstance(
         preds,
@@ -634,16 +658,19 @@ def postprocess_predictions(
     ):
 
         if "pred" in preds:
+
             preds = preds[
                 "pred"
             ]
 
         elif "preds" in preds:
+
             preds = preds[
                 "preds"
             ]
 
         elif "output" in preds:
+
             preds = preds[
                 "output"
             ]
@@ -651,36 +678,130 @@ def postprocess_predictions(
         else:
 
             raise TypeError(
-                "\n无法解析 dict 类型模型输出。\n"
+                "\n无法解析 dict 模型输出。\n"
                 f"keys={list(preds.keys())}"
             )
 
-    outputs = (
-        nms.non_max_suppression(
+        # dict value may still be tuple
+        if isinstance(
             preds,
+            (tuple, list),
+        ):
 
-            conf_thres,
+            preds = preds[0]
 
-            iou_thres,
+    if not torch.is_tensor(
+        preds
+    ):
 
-            # Same detect-task behavior as
-            # Ultralytics DetectionValidator
-            nc=0,
-
-            multi_label=True,
-
-            agnostic=False,
-
-            max_det=max_det,
-
-            end2end=getattr(
-                model,
-                "end2end",
-                False,
-            ),
-
-            rotated=False,
+        raise TypeError(
+            "\n最终预测不是 Tensor。\n"
+            f"type={type(preds)}"
         )
+
+    # ========================================================
+    # 3. YOLO26 end-to-end
+    #
+    # Expected:
+    #
+    #   [B, N, 6]
+    #
+    # columns:
+    #
+    #   x1 y1 x2 y2 conf cls
+    #
+    # No traditional NMS.
+    # ========================================================
+
+    is_end2end_output = (
+        preds.ndim == 3
+        and preds.shape[-1] == 6
+    )
+
+    if (
+        getattr(
+            model,
+            "end2end",
+            False,
+        )
+        or is_end2end_output
+    ):
+
+        results = []
+
+        for pred in preds:
+
+            # -----------------------------------------------
+            # confidence filtering
+            # -----------------------------------------------
+
+            keep = (
+                pred[:, 4]
+                >= conf_thres
+            )
+
+            pred = pred[
+                keep
+            ]
+
+            # -----------------------------------------------
+            # sort high confidence first
+            # -----------------------------------------------
+
+            if pred.shape[0] > 0:
+
+                order = torch.argsort(
+                    pred[:, 4],
+                    descending=True,
+                )
+
+                pred = pred[
+                    order
+                ]
+
+            pred = pred[
+                :max_det
+            ]
+
+            results.append(
+                {
+                    "bboxes":
+                        pred[:, :4],
+
+                    "conf":
+                        pred[:, 4],
+
+                    "cls":
+                        pred[:, 5],
+                }
+            )
+
+        return results
+
+    # ========================================================
+    # 4. YOLO11 / traditional YOLO
+    #
+    # Requires NMS.
+    # ========================================================
+
+    outputs = nms.non_max_suppression(
+        preds,
+
+        conf_thres,
+
+        iou_thres,
+
+        nc=model.nc,
+
+        multi_label=True,
+
+        agnostic=False,
+
+        max_det=max_det,
+
+        end2end=False,
+
+        rotated=False,
     )
 
     results = []
@@ -690,22 +811,13 @@ def postprocess_predictions(
         results.append(
             {
                 "bboxes":
-                    output[
-                        :,
-                        :4
-                    ],
+                    output[:, :4],
 
                 "conf":
-                    output[
-                        :,
-                        4
-                    ],
+                    output[:, 4],
 
                 "cls":
-                    output[
-                        :,
-                        5
-                    ],
+                    output[:, 5],
             }
         )
 

@@ -60,7 +60,12 @@ from datasets.rgbt_dataset import (
 from models.rgbt_model import (
     RGBTDetectionModel,
 )
-
+from val_rgbt import (
+    postprocess_predictions,
+    prepare_rgb_ground_truth,
+    process_single_image,
+)
+from ultralytics.utils.metrics import DetMetrics
 
 # ============================================================
 # 1. Reproducibility
@@ -1216,7 +1221,437 @@ def validate_loss(
         )
     )
 
+# ============================================================
+# 14. Detection metrics validation
+# ============================================================
 
+@torch.inference_mode()
+def validate_metrics(
+    model,
+    loader,
+    device,
+    amp=True,
+    conf_thres=0.001,
+    iou_thres=0.7,
+    max_det=300,
+):
+    """
+    Calculate detection metrics on validation set.
+
+    Output
+    ------
+    {
+        "precision": ...
+        "recall": ...
+        "map50": ...
+        "map75": ...
+        "map5095": ...
+        "images": ...
+        "instances": ...
+    }
+
+    Important
+    ---------
+    Metrics use exactly the same core functions as val_rgbt.py:
+
+        postprocess_predictions()
+        prepare_rgb_ground_truth()
+        process_single_image()
+
+    Therefore training-time mAP should be consistent with
+    standalone val_rgbt.py.
+    """
+
+    # ========================================================
+    # Evaluation mode
+    # ========================================================
+
+    model.eval()
+
+    # ========================================================
+    # Class names
+    # ========================================================
+
+    names = model.names
+
+    if not isinstance(
+        names,
+        dict,
+    ):
+
+        names = {
+            i: name
+            for i, name
+            in enumerate(names)
+        }
+
+    names = {
+        int(k): str(v)
+        for k, v in names.items()
+    }
+
+    # ========================================================
+    # Ultralytics detection metrics
+    # ========================================================
+
+    metrics = DetMetrics(
+        names=names
+    )
+
+    # ========================================================
+    # IoU thresholds:
+    #
+    # 0.50
+    # 0.55
+    # ...
+    # 0.95
+    # ========================================================
+
+    iouv = torch.linspace(
+        0.50,
+        0.95,
+        10,
+        device=device,
+    )
+
+    # ========================================================
+    # Statistics
+    # ========================================================
+
+    seen = 0
+
+    total_instances = 0
+
+    num_batches = len(
+        loader
+    )
+
+    # ========================================================
+    # Ultralytics-style validation header
+    # ========================================================
+
+    header = (
+        f"{'Class':>22}"
+        f"{'Images':>11}"
+        f"{'Instances':>11}"
+        f"{'Box(P':>11}"
+        f"{'R':>11}"
+        f"{'mAP50':>11}"
+        f"{'mAP50-95)':>13}"
+    )
+
+    print(
+        header
+    )
+
+    # ========================================================
+    # Progress bar
+    # ========================================================
+
+    pbar = tqdm(
+        loader,
+
+        total=num_batches,
+
+        dynamic_ncols=True,
+
+        leave=True,
+
+        bar_format=(
+            "{desc} "
+            "{percentage:3.0f}%|"
+            "{bar}| "
+            "{n_fmt}/{total_fmt} "
+            "[{elapsed}<{remaining}, "
+            "{rate_fmt}]"
+        ),
+    )
+
+    pbar.set_description(
+        f"{'validating':>22}",
+        refresh=False,
+    )
+
+    # ========================================================
+    # Validation loop
+    # ========================================================
+
+    for batch in pbar:
+
+        # ----------------------------------------------------
+        # Number of images in current batch
+        # ----------------------------------------------------
+
+        batch_size_current = int(
+            batch[
+                "rgb_img"
+            ].shape[0]
+        )
+
+        seen += (
+            batch_size_current
+        )
+
+        total_instances += int(
+            batch[
+                "rgb_cls"
+            ].shape[0]
+        )
+
+        # ----------------------------------------------------
+        # Move data to GPU
+        # ----------------------------------------------------
+
+        batch = preprocess_batch(
+            batch,
+            device,
+        )
+
+        # ----------------------------------------------------
+        # RGB-T inference
+        # ----------------------------------------------------
+
+        with autocast_context(
+            device,
+            amp,
+        ):
+
+            preds = model(
+                batch[
+                    "rgb_img"
+                ],
+
+                batch[
+                    "tir_img"
+                ],
+            )
+
+        # ----------------------------------------------------
+        # YOLO postprocess
+        # ----------------------------------------------------
+
+        preds = postprocess_predictions(
+            preds=preds,
+
+            model=model,
+
+            conf_thres=conf_thres,
+
+            iou_thres=iou_thres,
+
+            max_det=max_det,
+        )
+
+        # ====================================================
+        # Per-image statistics
+        # ====================================================
+
+        for sample_index, pred in enumerate(
+            preds
+        ):
+
+            # ------------------------------------------------
+            # RGB GT
+            # ------------------------------------------------
+
+            gt = prepare_rgb_ground_truth(
+                batch,
+                sample_index,
+            )
+
+            # ------------------------------------------------
+            # TP at IoU 0.50:0.95
+            # ------------------------------------------------
+
+            tp = process_single_image(
+                pred=pred,
+
+                gt=gt,
+
+                iouv=iouv,
+            )
+
+            # ------------------------------------------------
+            # GT classes
+            # ------------------------------------------------
+
+            target_cls = (
+                gt[
+                    "cls"
+                ]
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
+            )
+
+            # ------------------------------------------------
+            # Predictions
+            # ------------------------------------------------
+
+            if (
+                pred[
+                    "cls"
+                ].shape[0]
+                == 0
+            ):
+
+                pred_conf = np.zeros(
+                    0,
+                    dtype=np.float32,
+                )
+
+                pred_cls = np.zeros(
+                    0,
+                    dtype=np.float32,
+                )
+
+            else:
+
+                pred_conf = (
+                    pred[
+                        "conf"
+                    ]
+                    .detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+
+                pred_cls = (
+                    pred[
+                        "cls"
+                    ]
+                    .detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+
+            # ------------------------------------------------
+            # Update Ultralytics metrics
+            # ------------------------------------------------
+
+            metrics.update_stats(
+                {
+                    "tp":
+                        tp,
+
+                    "conf":
+                        pred_conf,
+
+                    "pred_cls":
+                        pred_cls,
+
+                    "target_cls":
+                        target_cls,
+
+                    "target_img":
+                        np.unique(
+                            target_cls
+                        ),
+
+                    "im_name":
+                        Path(
+                            batch[
+                                "rgb_path"
+                            ][sample_index]
+                        ).name,
+                }
+            )
+
+        # ====================================================
+        # Progress display
+        # ====================================================
+
+        pbar.set_description(
+            (
+                f"{'all':>22}"
+                f"{seen:>11}"
+                f"{total_instances:>11}"
+            ),
+            refresh=False,
+        )
+
+    pbar.close()
+
+    # ========================================================
+    # Calculate final metrics
+    # ========================================================
+
+    metrics.process(
+        plot=False
+    )
+
+    (
+        precision,
+        recall,
+        map50,
+        map5095,
+    ) = metrics.mean_results()
+
+    map75 = float(
+        metrics.box.map75
+    )
+
+    precision = float(
+        precision
+    )
+
+    recall = float(
+        recall
+    )
+
+    map50 = float(
+        map50
+    )
+
+    map5095 = float(
+        map5095
+    )
+
+    # ========================================================
+    # Official-style summary line
+    # ========================================================
+
+    print(
+        (
+            f"{'all':>22}"
+            f"{seen:>11}"
+            f"{total_instances:>11}"
+            f"{precision:>11.3f}"
+            f"{recall:>11.3f}"
+            f"{map50:>11.3f}"
+            f"{map5095:>13.3f}"
+        )
+    )
+
+    # ========================================================
+    # Return values are 0~1, NOT percentages
+    # ========================================================
+
+    return {
+        "precision":
+            precision,
+
+        "recall":
+            recall,
+
+        "map50":
+            map50,
+
+        "map75":
+            map75,
+
+        "map5095":
+            map5095,
+
+        "images":
+            seen,
+
+        "instances":
+            total_instances,
+    }
 # ============================================================
 # 14. Main training
 # ============================================================
@@ -1708,6 +2143,10 @@ def train(cfg: Dict):
         # Validation
         # ----------------------------------------------------
 
+        # ----------------------------------------------------
+        # Validation loss
+        # ----------------------------------------------------
+
         val_loss = validate_loss(
             model=model,
 
@@ -1720,6 +2159,29 @@ def train(cfg: Dict):
             epoch=epoch,
 
             epochs=epochs,
+        )
+
+
+        # ----------------------------------------------------
+        # Validation detection metrics
+        #
+        # Same metric pipeline as val_rgbt.py
+        # ----------------------------------------------------
+
+        val_metrics = validate_metrics(
+            model=model,
+
+            loader=val_loader,
+
+            device=device,
+
+            amp=amp,
+
+            conf_thres=0.001,
+
+            iou_thres=0.7,
+
+            max_det=300,
         )
 
         # ----------------------------------------------------
@@ -1778,13 +2240,28 @@ def train(cfg: Dict):
         )
 
         print(
-            f"  val_loss   = "
-            f"{val_loss:.6f}"
+            f"  precision  = "
+            f"{val_metrics['precision']:.4f}"
         )
 
         print(
-            f"  lr         = "
-            f"{current_lr:.8f}"
+            f"  recall     = "
+            f"{val_metrics['recall']:.4f}"
+        )
+
+        print(
+            f"  mAP50      = "
+            f"{val_metrics['map50']:.4f}"
+        )
+
+        print(
+            f"  mAP75      = "
+            f"{val_metrics['map75']:.4f}"
+        )
+
+        print(
+            f"  mAP50-95   = "
+            f"{val_metrics['map5095']:.4f}"
         )
 
         # ----------------------------------------------------
@@ -1809,6 +2286,31 @@ def train(cfg: Dict):
 
             "val_loss":
                 val_loss,
+
+            "precision":
+                val_metrics[
+                    "precision"
+                ],
+
+            "recall":
+                val_metrics[
+                    "recall"
+                ],
+
+            "map50":
+                val_metrics[
+                    "map50"
+                ],
+
+            "map75":
+                val_metrics[
+                    "map75"
+                ],
+
+            "map5095":
+                val_metrics[
+                    "map5095"
+                ],
 
             "lr":
                 current_lr,
