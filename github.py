@@ -12,7 +12,7 @@ git push
 不同分支
 cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
 git status
-git checkout -b backup/rsdt-current-20260818
+git checkout -b RSDT&Alignment
 git add .
 git commit -m "backup: save current RSD-T version"
 git push -u origin backup/rsdt-current-20260818

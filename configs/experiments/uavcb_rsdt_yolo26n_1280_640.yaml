@@ -4,19 +4,20 @@
 # After it runs correctly, change epochs to 300.
 # ============================================================
 traincc:
+  conda activate tcy
   cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
   mkdir -p logs
   nohup python -u train_rsdt.py \
     --cfg configs/experiments/uavcb_rsdt_yolo26n_1280_640.yaml \
-    > logs/uavcb_rsdt_yolo26n_1280_640_P3.log 2>&1 &
+    > logs/uavcb_rsdt_yolo26n_1280_640_P345.log 2>&1 &
 
-  echo $! > pid/uavcb_rsdt_yolo26n_1280_640_P3.pid
-  tail -f logs/uavcb_rsdt_yolo26n_1280_640_P3.log
+  echo $! > pid/uavcb_rsdt_yolo26n_1280_640_P345.pid
+  tail -f logs/uavcb_rsdt_yolo26n_1280_640_P345.log
 
   conda activate tcy
   cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
   python val_rsdt.py \
-    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rsdt/yolo26n_UAVCB_rsdt_v1_rgb1280_sem640_tir640_seed0/weights/best.pt \
+    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rsdt/yolo26n_UAVCB_rsdt_P345_rgb1280_sem640_tir640_seed0/weights/best.pt \
     --split test \
     --rgb /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml \
     --tir /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml \
@@ -24,7 +25,7 @@ traincc:
     --rgb-semantic-imgsz 640 \
     --tir-imgsz 640 \
     --batch 8 \
-    --device 2 \
+    --device 4 \
     --plots \
     --preview-num 6 \
     --preview-conf 0.25 \
@@ -33,102 +34,91 @@ traincc:
 model:
   name: yolo26n
   pretrained: true
-
-  # Original final RGB-T fusion remains unchanged.
+  # Original RGB-T fusion
   fusion: concat
   align_mode: bilinear
-
-  # ----------------------------------------------------------
-  # RSD-T scale selector
-  # ----------------------------------------------------------
-  rsdt_scales: [3]
-
-  # true  = RGB-T semantic guidance
-  # false = resolution-detail branch without semantic guidance
+  # [3, 4, 5] -> P3 + P4 + P5
+  rsdt_scales: [3, 4, 5]
   use_guidance: true
-
-  # Shared high-resolution DetailStem
   detail_channels: 64
   stem_channels: 24
-
-  # Each selected scale owns an independent Guidance Generator.
   guide_channels: 32
-
-
+  
+  alignment:
+    # CURRENT VERSION: OFF
+    #
+    # false -> IdentityAlignment
+    #          raw TIR is passed through unchanged
+    #          no learnable alignment parameters
+    enabled: false
+    # Current built-in type.
+    type: identity
+    # Reserved for a future real alignment plugin.
+    # Example:
+    #
+    # target: models.modules.alignment.offset_alignment:OffsetAlignment
+    target: null
+  # /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rgbt/yolo26n_LRDDv3_rgbt_concat_640_b24_seed0/weights/last.pt
+    # Which pyramid levels a future alignment plugin should process.
+    scales: [3]
+    # If alignment is enabled in the future:
+    # true -> aligned TIR guides RSD-T
+    # false -> raw TIR guides RSD-T
+    use_for_rsdt: true
+    # If alignment is enabled in the future:
+    # true -> aligned TIR enters final RGB-T fusion
+    # false -> raw TIR enters final RGB-T fusion
+    use_for_fusion: true
+    # Reserved future plugin parameters.
+    hidden_channels: 32
+    use_confidence: true
 data:
   rgb: /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml
-
   tir: /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml
-
-  # Existing LetterBox from the SAME original RGB:
-  #
-  # raw RGB -> LetterBox(1280) -> RGB high
-  # raw RGB -> LetterBox(640)  -> RGB semantic
+  # SAME raw RGB -> existing LetterBox at two resolutions.
   rgb_imgsz: 1280
   rgb_semantic_imgsz: 640
-
-  # raw TIR -> LetterBox(640)
   tir_imgsz: 640
-
   pair_mode: relative
-
 
 train:
   # Stage 1
   epochs: 300
-
   batch: 24
   workers: 4
-  device: 3
-
+  device: 5
   optimizer: SGD
-
   lr0: 0.01
   lrf: 0.01
-
   momentum: 0.937
   weight_decay: 0.0005
-
   amp: true
-
   seed: 0
   deterministic: true
-
   grad_clip: 10.0
-
-  # best.pt / early stopping:
-  # validation mAP50-95
   patience: 50
   early_stop_min_delta: 0.000001
-
   resume: null
-
   # Stage 2
   stage2:
     enabled: true
     epochs: 200
-
     lr0: 0.001
     lrf: 0.01
-
     patience: 50
     early_stop_min_delta: 0.000001
-
 
 augment:
   fliplr: 0.5
   flipud: 0.0
-
-
+  
 loss:
   box: 7.5
   cls: 0.5
   dfl: 1.5
 
-
 output:
   project: runs/rsdt
-
-  # Change this name together with rsdt_scales
-  # so different ablations never overwrite each other.
-  name: yolo26n_UAVCB_rsdt_P3_rgb1280_sem640_tir640_seed0
+  # Keep your current experiment naming convention.
+  # Change this for P4/P5/multiscale ablations to avoid mixing results.
+  name: yolo26n_UAVCB_rsdt_P345_rgb1280_sem640_tir640_seed0

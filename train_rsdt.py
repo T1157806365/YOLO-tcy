@@ -600,6 +600,11 @@ def build_rsdt_model_adapter(
             )
         ),
 
+        alignment_cfg=model_cfg.get(
+            "alignment",
+            {},
+        ),
+
         verbose=verbose,
     )
 
@@ -816,6 +821,23 @@ def train(
         f"RSD-T scales    : "
         f"{cfg.get('model', {}).get('rsdt_scales', [3])}"
     )
+
+    alignment_cfg = (
+        cfg.get(
+            "model",
+            {},
+        ).get(
+            "alignment",
+            {},
+        )
+    )
+
+    print(
+        f"Alignment       : "
+        f"enabled={alignment_cfg.get('enabled', False)}, "
+        f"type={alignment_cfg.get('type', 'identity')}"
+    )
+
     print(
         f"TIR             : "
         f"{cfg['data'].get('tir_imgsz', 640)}"

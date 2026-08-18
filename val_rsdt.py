@@ -386,6 +386,11 @@ def load_rsdt_checkpoint(
             )
         ),
 
+        alignment_cfg=model_cfg.get(
+            "alignment",
+            {},
+        ),
+
         verbose=False,
     )
 
@@ -1017,6 +1022,11 @@ def validate(
     )
     print(
         f"RSD-T scales   : {list(model.rsdt_scales)}"
+    )
+    print(
+        f"Alignment      : "
+        f"enabled={model.alignment_enabled}, "
+        f"type={model.alignment_cfg.get('type', 'identity')}"
     )
     print(
         f"Batch          : {batch_size}"
@@ -1815,6 +1825,31 @@ def validate(
                 str(k): float(v)
                 for k, v in rsdt_state.items()
             },
+        },
+
+        "alignment": {
+            "enabled":
+                bool(
+                    model.alignment_enabled
+                ),
+
+            "type":
+                str(
+                    model.alignment_cfg.get(
+                        "type",
+                        "identity",
+                    )
+                ),
+
+            "use_for_rsdt":
+                bool(
+                    model.alignment_use_for_rsdt
+                ),
+
+            "use_for_fusion":
+                bool(
+                    model.alignment_use_for_fusion
+                ),
         },
 
         "complexity": {

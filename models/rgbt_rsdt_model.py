@@ -1,31 +1,42 @@
 """
-Configurable Multi-Scale RGB-T + RSD-T Detection Model
-======================================================
+RGB-T + RSD-T with Optional Pluggable Alignment
+===============================================
 
-Zero-intrusion extension of:
-    models/rgbt_model.py
+Design goal
+-----------
+Keep alignment and RSD-T completely decoupled.
 
-Original RGB-T model is not modified.
+Current pipeline:
+    RGB/TIR Backbones
+        -> IdentityAlignment (alignment disabled)
+        -> RSD-T
+        -> original RGB-T fusion
+        -> neck/detect
 
-YAML control:
-    rsdt_scales: [3]
-    rsdt_scales: [4]
-    rsdt_scales: [5]
-    rsdt_scales: [3, 4]
-    rsdt_scales: [3, 4, 5]
+Future pipeline:
+    RGB/TIR Backbones
+        -> any BaseAlignment-compatible plugin
+        -> RSD-T and/or original RGB-T fusion
+        -> neck/detect
 
-Scale mapping:
-    P3 -> fusion_indices[0]
-    P4 -> fusion_indices[1]
-    P5 -> fusion_indices[2]
+Current YAML:
+    alignment:
+      enabled: false
 
-The shared high-resolution DetailStem runs only once.
-Each selected scale has an independent guidance/injection adapter.
+When disabled:
+    aligned_tir == raw_tir
+
+so the network behaves like the current RSD-T implementation.
+
+Alignment can independently be routed to:
+    use_for_rsdt
+    use_for_fusion
 """
 
 from __future__ import annotations
 
 from typing import (
+    Any,
     Dict,
     Iterable,
     Optional,
@@ -42,6 +53,10 @@ from models.rgbt_model import (
 
 from models.modules.rsd_t_v1 import (
     MultiScaleRSDTv1,
+)
+
+from models.modules.alignment.builder import (
+    build_alignment,
 )
 
 
@@ -71,7 +86,7 @@ class RGBTRSDTDetectionModel(
         semantic_imgsz: int = 640,
 
         # -----------------------------------------------------
-        # New configurable scale selector
+        # RSD-T
         # -----------------------------------------------------
         rsdt_scales: Iterable[int] = (3,),
 
@@ -80,6 +95,13 @@ class RGBTRSDTDetectionModel(
         detail_channels: int = 64,
         stem_channels: int = 24,
         guide_channels: int = 32,
+
+        # -----------------------------------------------------
+        # Optional alignment plugin
+        # -----------------------------------------------------
+        alignment_cfg: Optional[
+            Dict[str, Any]
+        ] = None,
 
         verbose: bool = True,
     ):
@@ -105,6 +127,10 @@ class RGBTRSDTDetectionModel(
         self.use_guidance = bool(
             use_guidance
         )
+
+        # =====================================================
+        # RSD-T scale configuration
+        # =====================================================
 
         self.rsdt_scales = tuple(
             sorted(
@@ -136,11 +162,6 @@ class RGBTRSDTDetectionModel(
                 f"当前非法值={invalid}"
             )
 
-        # -----------------------------------------------------
-        # Current RGBTDetectionModel exposes its three pyramid
-        # fusion locations in P3/P4/P5 order.
-        # -----------------------------------------------------
-
         if len(
             self.fusion_indices
         ) < 3:
@@ -149,6 +170,7 @@ class RGBTRSDTDetectionModel(
                 "P3/P4/P5 fusion indices."
             )
 
+        # Map conceptual P3/P4/P5 to the actual backbone output index.
         self.rsdt_scale_to_index = {
             3:
                 int(
@@ -172,9 +194,9 @@ class RGBTRSDTDetectionModel(
                 ),
         }
 
-        # -----------------------------------------------------
-        # Infer actual channels, no hard coding.
-        # -----------------------------------------------------
+        # =====================================================
+        # Infer actual feature channels
+        # =====================================================
 
         feature_channels = (
             self._infer_feature_channels()
@@ -211,9 +233,9 @@ class RGBTRSDTDetectionModel(
                 ]
             )
 
-        # -----------------------------------------------------
-        # Shared DetailStem + per-scale adapters
-        # -----------------------------------------------------
+        # =====================================================
+        # RSD-T
+        # =====================================================
 
         self.rsdt = MultiScaleRSDTv1(
             rgb_channels=rgb_channels,
@@ -239,48 +261,95 @@ class RGBTRSDTDetectionModel(
             exact_identity_when_equal=True,
         )
 
+        # =====================================================
+        # Optional Alignment Plugin
+        # =====================================================
+
+        self.alignment_cfg = dict(
+            alignment_cfg or {}
+        )
+
+        self.alignment_enabled = bool(
+            self.alignment_cfg.get(
+                "enabled",
+                False,
+            )
+        )
+
+        self.alignment_use_for_rsdt = bool(
+            self.alignment_cfg.get(
+                "use_for_rsdt",
+                True,
+            )
+        )
+
+        self.alignment_use_for_fusion = bool(
+            self.alignment_cfg.get(
+                "use_for_fusion",
+                True,
+            )
+        )
+
+        # Important:
+        # enabled=false -> IdentityAlignment -> no parameters / no changes.
+        self.alignment = build_alignment(
+            self.alignment_cfg
+        )
+
         if verbose:
             print(
                 "\n"
                 "============================================================"
             )
             print(
-                "Enable configurable Multi-Scale RSD-T v1"
+                "RSD-T + Pluggable Alignment Framework"
             )
             print(
                 "============================================================"
             )
             print(
-                f"RSD-T scales    : "
+                f"RSD-T scales       : "
                 f"{list(self.rsdt_scales)}"
             )
-
-            for scale in self.rsdt_scales:
-                print(
-                    f"P{scale} layer       : "
-                    f"{self.rsdt_scale_to_index[scale]}"
-                )
-
-                print(
-                    f"P{scale} RGB/TIR C   : "
-                    f"{rgb_channels[scale]}/"
-                    f"{tir_channels[scale]}"
-                )
-
             print(
-                f"RGB semantic   : "
+                f"RGB semantic       : "
                 f"{self.semantic_imgsz}"
             )
             print(
-                f"Guidance       : "
+                f"RSD-T guidance     : "
                 f"{self.use_guidance}"
             )
             print(
-                "Shared DetailStem: 1x"
+                "Shared DetailStem   : 1x"
+            )
+
+            print(
+                "------------------------------------------------------------"
+            )
+
+            print(
+                f"Alignment enabled  : "
+                f"{self.alignment_enabled}"
             )
             print(
-                "gamma init      : 0.0 per scale"
+                f"Alignment type     : "
+                f"{self.alignment_cfg.get('type', 'identity')}"
             )
+            print(
+                f"Use for RSD-T      : "
+                f"{self.alignment_use_for_rsdt}"
+            )
+            print(
+                f"Use for fusion     : "
+                f"{self.alignment_use_for_fusion}"
+            )
+
+            if not self.alignment_enabled:
+                print(
+                    "Alignment behavior : "
+                    "Identity / bypass"
+                )
+
             print(
                 "============================================================\n"
             )
@@ -327,6 +396,7 @@ class RGBTRSDTDetectionModel(
         ] = None,
 
         return_rsdt_debug: bool = False,
+        return_alignment_debug: bool = False,
     ) -> Dict:
 
         if rgb_semantic is None:
@@ -337,7 +407,7 @@ class RGBTRSDTDetectionModel(
             )
 
         # -----------------------------------------------------
-        # Original two full semantic backbones
+        # 1. Original semantic backbones
         # -----------------------------------------------------
 
         rgb_outputs = list(
@@ -352,8 +422,72 @@ class RGBTRSDTDetectionModel(
             )
         )
 
+        # Keep the raw TIR stream explicitly.
+        raw_tir_outputs = tir_outputs
+
         # -----------------------------------------------------
-        # Build only selected scale feature dictionaries.
+        # 2. Optional pluggable alignment
+        #
+        # Current:
+        #     IdentityAlignment
+        #     aligned_tir_outputs == raw_tir_outputs
+        #
+        # Future:
+        #     Offset / correlation / deformable / other plugin
+        # -----------------------------------------------------
+
+        (
+            aligned_tir_outputs,
+            alignment_info,
+        ) = self.alignment(
+            rgb_features=rgb_outputs,
+            tir_features=raw_tir_outputs,
+            scale_to_index=(
+                self.rsdt_scale_to_index
+            ),
+            return_debug=(
+                return_alignment_debug
+                or return_rsdt_debug
+            ),
+        )
+
+        # -----------------------------------------------------
+        # 3. Routing policy
+        #
+        # Alignment can later serve:
+        #     a) RSD-T only
+        #     b) fusion only
+        #     c) both
+        #
+        # Current alignment OFF -> both routes are unchanged.
+        # -----------------------------------------------------
+
+        if (
+            self.alignment_enabled
+            and self.alignment_use_for_rsdt
+        ):
+            tir_for_rsdt = (
+                aligned_tir_outputs
+            )
+        else:
+            tir_for_rsdt = (
+                raw_tir_outputs
+            )
+
+        if (
+            self.alignment_enabled
+            and self.alignment_use_for_fusion
+        ):
+            tir_for_fusion = (
+                aligned_tir_outputs
+            )
+        else:
+            tir_for_fusion = (
+                raw_tir_outputs
+            )
+
+        # -----------------------------------------------------
+        # 4. Select P3/P4/P5 features for RSD-T
         # -----------------------------------------------------
 
         rgb_scale_features = {}
@@ -375,15 +509,15 @@ class RGBTRSDTDetectionModel(
 
             tir_scale_features[
                 scale
-            ] = tir_outputs[
+            ] = tir_for_rsdt[
                 index
             ]
 
-        rsdt_debug = None
+        # -----------------------------------------------------
+        # 5. RSD-T
+        # -----------------------------------------------------
 
-        # -----------------------------------------------------
-        # Shared high-resolution detail + selected scales
-        # -----------------------------------------------------
+        rsdt_debug = None
 
         if return_rsdt_debug:
 
@@ -392,37 +526,45 @@ class RGBTRSDTDetectionModel(
                 rsdt_debug,
             ) = self.rsdt(
                 rgb_high=rgb,
+
                 rgb_semantic=(
                     rgb_semantic
                 ),
+
                 rgb_features=(
                     rgb_scale_features
                 ),
+
                 tir_features=(
                     tir_scale_features
                 ),
+
                 return_debug=True,
             )
 
         else:
 
-            enhanced_features = self.rsdt(
-                rgb_high=rgb,
-                rgb_semantic=rgb_semantic,
-                rgb_features=(
-                    rgb_scale_features
-                ),
-                tir_features=(
-                    tir_scale_features
-                ),
-                return_debug=False,
+            enhanced_features = (
+                self.rsdt(
+                    rgb_high=rgb,
+
+                    rgb_semantic=(
+                        rgb_semantic
+                    ),
+
+                    rgb_features=(
+                        rgb_scale_features
+                    ),
+
+                    tir_features=(
+                        tir_scale_features
+                    ),
+
+                    return_debug=False,
+                )
             )
 
-        # -----------------------------------------------------
-        # Replace ONLY selected RGB pyramid levels.
-        # Non-selected levels remain exactly original.
-        # -----------------------------------------------------
-
+        # Replace only selected RGB pyramid levels.
         for scale in self.rsdt_scales:
 
             index = (
@@ -438,7 +580,13 @@ class RGBTRSDTDetectionModel(
             ]
 
         # -----------------------------------------------------
-        # Original final RGB-T fusion stays unchanged.
+        # 6. Original RGB-T fusion
+        #
+        # Current alignment OFF:
+        #     tir_for_fusion == raw_tir_outputs
+        #
+        # Future alignment ON:
+        #     can use aligned TIR if YAML requests it.
         # -----------------------------------------------------
 
         (
@@ -446,15 +594,25 @@ class RGBTRSDTDetectionModel(
             fusion_features,
         ) = self.fuse_backbone_features(
             rgb_outputs,
-            tir_outputs,
+            tir_for_fusion,
         )
 
         result = {
             "rgb_backbone":
                 rgb_outputs,
 
+            # Raw TIR is kept for backward/debug semantics.
             "tir_backbone":
-                tir_outputs,
+                raw_tir_outputs,
+
+            "aligned_tir_backbone":
+                aligned_tir_outputs,
+
+            "tir_for_rsdt":
+                tir_for_rsdt,
+
+            "tir_for_fusion":
+                tir_for_fusion,
 
             "fused_backbone":
                 fused_outputs,
@@ -472,12 +630,29 @@ class RGBTRSDTDetectionModel(
                 dict(
                     self.rsdt_scale_to_index
                 ),
+
+            "alignment_enabled":
+                self.alignment_enabled,
+
+            "alignment_type":
+                self.alignment_cfg.get(
+                    "type",
+                    "identity",
+                ),
         }
 
         if return_rsdt_debug:
             result[
                 "rsdt_debug"
             ] = rsdt_debug
+
+        if (
+            return_alignment_debug
+            or return_rsdt_debug
+        ):
+            result[
+                "alignment_info"
+            ] = alignment_info
 
         return result
 
@@ -496,6 +671,7 @@ class RGBTRSDTDetectionModel(
 
         return_features: bool = False,
         return_rsdt_debug: bool = False,
+        return_alignment_debug: bool = False,
     ):
 
         features = self.forward_features(
@@ -506,6 +682,10 @@ class RGBTRSDTDetectionModel(
 
             return_rsdt_debug=(
                 return_rsdt_debug
+            ),
+
+            return_alignment_debug=(
+                return_alignment_debug
             ),
         )
 
@@ -518,6 +698,7 @@ class RGBTRSDTDetectionModel(
         if (
             return_features
             or return_rsdt_debug
+            or return_alignment_debug
         ):
             return {
                 "pred":
@@ -539,8 +720,10 @@ class RGBTRSDTDetectionModel(
         rgb_semantic=None,
         return_features: bool = False,
         return_rsdt_debug: bool = False,
+        return_alignment_debug: bool = False,
     ):
 
+        # Training batch.
         if isinstance(
             rgb,
             dict,
@@ -567,6 +750,10 @@ class RGBTRSDTDetectionModel(
             return_rsdt_debug=(
                 return_rsdt_debug
             ),
+
+            return_alignment_debug=(
+                return_alignment_debug
+            ),
         )
 
     # ========================================================
@@ -579,8 +766,8 @@ class RGBTRSDTDetectionModel(
         preds=None,
     ):
         """
-        Detection head stays in semantic-RGB coordinates.
-        This is independent of whether P3/P4/P5 are enhanced.
+        Final head remains in semantic-RGB coordinates.
+        Alignment does not change label coordinates.
         """
 
         required = [
@@ -594,6 +781,7 @@ class RGBTRSDTDetectionModel(
         ]
 
         for key in required:
+
             if key not in batch:
                 raise KeyError(
                     f"RSD-T batch missing: {key}"
@@ -605,6 +793,7 @@ class RGBTRSDTDetectionModel(
             )
 
         if preds is None:
+
             preds = self.predict(
                 batch[
                     "rgb_img"
@@ -649,7 +838,7 @@ class RGBTRSDTDetectionModel(
         )
 
     # ========================================================
-    # Information
+    # Info
     # ========================================================
 
     def print_info(
@@ -663,37 +852,52 @@ class RGBTRSDTDetectionModel(
         )
 
         print(
-            "Multi-Scale RSD-T v1:"
+            "RSD-T + Optional Alignment:"
         )
 
         print(
-            f"  scales          : "
+            f"  RSD-T scales     : "
             f"{list(self.rsdt_scales)}"
         )
 
         print(
-            f"  semantic imgsz  : "
+            f"  semantic imgsz   : "
             f"{self.semantic_imgsz}"
         )
 
         print(
-            f"  guidance        : "
+            f"  guidance         : "
             f"{self.use_guidance}"
         )
 
         print(
-            "  shared detail   : "
-            "DetailStem x1"
+            f"  alignment        : "
+            f"{self.alignment_enabled}"
+        )
+
+        print(
+            f"  alignment type   : "
+            f"{self.alignment_cfg.get('type', 'identity')}"
+        )
+
+        print(
+            f"  align -> RSD-T   : "
+            f"{self.alignment_use_for_rsdt}"
+        )
+
+        print(
+            f"  align -> fusion  : "
+            f"{self.alignment_use_for_fusion}"
         )
 
         for scale in self.rsdt_scales:
 
             print(
-                f"  P{scale} alpha       : "
+                f"  P{scale} alpha        : "
                 f"{state[f'alpha_p{scale}']:.6f}"
             )
 
             print(
-                f"  P{scale} gamma       : "
+                f"  P{scale} gamma        : "
                 f"{state[f'gamma_p{scale}']:.6f}"
             )
