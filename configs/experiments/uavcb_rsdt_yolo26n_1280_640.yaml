@@ -1,0 +1,63 @@
+# ============================================================
+# UAV-CB: isolated RGB-T + RSD-T v1
+# First use this as a 1-epoch smoke test.
+# After it runs correctly, change epochs to 300.
+# ============================================================
+traincc:
+  conda activate tcy
+  cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
+  python train_rsdt.py \
+  --cfg configs/experiments/uavcb_rsdt_yolo26n_1280_640.yaml
+
+  python val_rsdt.py \
+  --weights runs/rsdt/yolo26n_UAVCB_rsdt_v1_rgb1280_sem640_tir640_seed0/weights/best.pt \
+  --split val \
+  --device 5 \
+  --batch 4
+
+model:
+  name: yolo26n
+  pretrained: true
+  # Keep original RGB-T fusion unchanged.
+  # concat / add / weighted
+  fusion: concat
+  align_mode: bilinear
+  # RSD-T v1
+  use_guidance: true
+  detail_channels: 64
+  stem_channels: 24
+  guide_channels: 32
+data:
+  rgb: /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml
+  tir: /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml
+  # High-resolution RGB used only by the shallow detail branch.
+  rgb_high_imgsz: 1280
+  rgb_semantic_imgsz: 640
+  tir_imgsz: 640
+  pair_mode: relative
+train:
+  epochs: 300
+  batch: 24
+  workers: 4
+  device: 5
+  optimizer: SGD
+  lr0: 0.01
+  lrf: 0.01
+  momentum: 0.937
+  weight_decay: 0.0005
+  amp: true
+  seed: 0
+  deterministic: true
+  grad_clip: 10.0
+  resume: null
+# /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rgbt/yolo26n_LRDDv3_rgbt_concat_640_b24_seed0/weights/last.pt
+augment:
+  fliplr: 0.5
+  flipud: 0.0
+loss:
+  box: 7.5
+  cls: 0.5
+  dfl: 1.5
+output:
+  project: runs/rsdt
+  name: yolo26n_UAVCB_rsdt_v1_rgb1280_sem640_tir640_seed0
