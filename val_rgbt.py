@@ -18,26 +18,26 @@ Current task:
     conda activate tcy
     cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
     python val_rgbt.py \
-    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rgbt/yolo26n_LRDDv3_rgbt_concat_640_b24_seed0/weights/best.pt \
+    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rgbt/yolo26n_LRDDv3_rgbt_concat_1280_b8_seed0/weights/best.pt \
     --rgb /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/LRDD_v3-RGB.yaml \
     --tir /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/LRDD_v3-TIR.yaml \
     --split test \
-    --rgb-imgsz 640 \
+    --rgb-imgsz 1280 \
     --tir-imgsz 640 \
-    --batch 4 \
-    --device 0
+    --batch 8 \
+    --device 5
 
     conda activate tcy
     cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
     python val_rgbt.py \
-    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rgbt/yolo26n_uavcb_rgbt_concat_640_b4_seed0/weights/best.pt \
+    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rgbt/yolo26n_uavcb_rgbt_add_960_b12_seed0/weights/best.pt \
     --rgb /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml \
     --tir /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml \
     --split test \
-    --rgb-imgsz 640 \
+    --rgb-imgsz 960 \
     --tir-imgsz 640 \
     --batch 4 \
-    --device 0
+    --device 5
 """
 
 from __future__ import annotations

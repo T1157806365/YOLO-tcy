@@ -6,7 +6,7 @@ model:
   pretrained: true
 
   # concat / add / weighted
-  fusion: har
+  fusion: concat
 
   # nearest / bilinear
   align_mode: bilinear
@@ -19,7 +19,7 @@ data:
   tir: /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml
 
   # 第一组 baseline 先保持一致
-  rgb_imgsz: 640
+  rgb_imgsz: 960
   tir_imgsz: 640
 
   # 如果你的 Dataset 测试是 stem，就改成 stem
@@ -29,7 +29,7 @@ data:
 # ============================================================
 train:
   epochs: 300
-  batch: 4
+  batch: 12
   workers: 4
   device: 5
   optimizer: SGD
@@ -72,4 +72,4 @@ loss:
 # ============================================================
 output:
   project: runs/rgbt
-  name: yolo26n_uavcb_rgbt_har_640_b4_seed0
+  name: yolo26n_uavcb_rgbt_concat_960_b12_seed0

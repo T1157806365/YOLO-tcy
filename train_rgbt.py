@@ -19,7 +19,7 @@ Project:
     conda activate tcy
     cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
     python train_rgbt.py \
-    --cfg configs/experiments/uavcb_har_yolo26n_640.yaml
+    --cfg configs/experiments/uavcb_add_yolo26n_640.yaml
 """
 from __future__ import annotations
 import argparse
