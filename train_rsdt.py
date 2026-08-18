@@ -1,28 +1,51 @@
 """
-Train isolated RGB-T + RSD-T v1
-===============================
+Full-feature RSD-T trainer for YOLO-tcy
+=======================================
 
-Original files remain untouched:
-    train_rgbt.py
-    datasets/rgbt_dataset.py
-    models/rgbt_model.py
+Design goal
+-----------
+Keep the original full-feature train_rgbt.py UNCHANGED and reuse its complete
+training engine:
 
-This script only imports reusable utilities from train_rgbt.py.
+- reproducibility
+- SGD / Adam / AdamW
+- cosine LR
+- AMP
+- gradient clipping
+- validation loss
+- validation P / R / mAP50 / mAP75 / mAP50-95 every epoch
+- best.pt selected by mAP50-95
+- early stopping by mAP50-95
+- two-stage training
+- stage2 starts from stage1 best
+- independent stage2 optimizer / scheduler / AMP scaler
+- resume
+- history.json
+- best.pt / last.pt
+- stage1_best.pt / stage1_last.pt
+- stage2_best.pt / stage2_last.pt
 
-Run:
-    python train_rsdt.py \
-        --cfg configs/experiments/uavcb_rsdt_yolo26n_1280_640.yaml
+Only RSD-T-specific pieces are replaced:
+- dataset
+- model
+- batch preprocessing
+- validation inference / GT coordinate handling
+
+Original files are not modified.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from typing import Dict
 
+import numpy as np
 import torch
 from tqdm import tqdm
+from ultralytics.utils.metrics import DetMetrics
+
+import train_rgbt as base_train
 
 from datasets.rsdt_dataset import (
     build_rsdt_dataset,
@@ -33,41 +56,42 @@ from models.rgbt_rsdt_model import (
     RGBTRSDTDetectionModel,
 )
 
-# Reuse stable utilities from the original trainer.
-from train_rgbt import (
-    ROOT,
-    set_seed,
-    load_config,
-    save_config,
-    select_device,
-    build_optimizer,
-    build_scheduler,
-    build_scaler,
-    autocast_context,
-    configure_model_loss,
-    save_checkpoint,
-    resume_checkpoint,
-    get_gpu_memory_gb,
-    normalize_loss_items,
-    update_running_losses,
-    get_standard_losses,
+from val_rgbt import (
+    postprocess_predictions,
+    process_single_image,
 )
 
+# ---------------------------------------------------------------------------
+# Active config is used by adapters called internally from base_train.train().
+# ---------------------------------------------------------------------------
+
+_ACTIVE_CFG: Dict = {}
+
+
+# ===========================================================================
+# 1. RSD-T batch preprocessing
+# ===========================================================================
 
 def preprocess_batch_rsdt(
     batch: Dict,
     device: torch.device,
 ):
     """
-    Move RSD-T batch to GPU and normalize images.
+    Move RSD-T batch to device.
+
+    Images:
+        rgb_img              = high-resolution RGB
+        rgb_semantic_img     = semantic RGB
+        tir_img              = TIR
+
+    uint8 [0,255] -> float32 [0,1]
     """
 
-    for key in [
+    for key in (
         "rgb_img",
         "rgb_semantic_img",
         "tir_img",
-    ]:
-
+    ):
         batch[key] = (
             batch[key]
             .to(
@@ -78,17 +102,17 @@ def preprocess_batch_rsdt(
             / 255.0
         )
 
-    for key in [
+    tensor_keys = (
         "rgb_cls",
         "rgb_bboxes",
         "rgb_semantic_bboxes",
         "rgb_batch_idx",
-
         "tir_cls",
         "tir_bboxes",
         "tir_batch_idx",
-    ]:
+    )
 
+    for key in tensor_keys:
         batch[key] = (
             batch[key]
             .to(
@@ -100,553 +124,447 @@ def preprocess_batch_rsdt(
     return batch
 
 
-def train_one_epoch_rsdt(
+# ===========================================================================
+# 2. Semantic-coordinate GT
+# ===========================================================================
+
+def prepare_rsdt_ground_truth(
+    batch: Dict,
+    sample_index: int,
+):
+    """
+    Final YOLO detection head runs in RGB semantic coordinates.
+
+    Therefore validation GT must use:
+        rgb_semantic_bboxes
+        rgb_semantic_img.shape
+
+    NOT the high-resolution rgb_bboxes/rgb_img shape.
+    """
+
+    from ultralytics.utils import ops
+
+    mask = (
+        batch["rgb_batch_idx"]
+        == sample_index
+    )
+
+    cls = (
+        batch["rgb_cls"][mask]
+        .squeeze(-1)
+    )
+
+    boxes = (
+        batch[
+            "rgb_semantic_bboxes"
+        ][mask]
+    )
+
+    h = int(
+        batch[
+            "rgb_semantic_img"
+        ].shape[2]
+    )
+
+    w = int(
+        batch[
+            "rgb_semantic_img"
+        ].shape[3]
+    )
+
+    if boxes.shape[0] > 0:
+        boxes = ops.xywh2xyxy(
+            boxes
+        )
+
+        scale = torch.tensor(
+            [w, h, w, h],
+            device=boxes.device,
+            dtype=boxes.dtype,
+        )
+
+        boxes = (
+            boxes
+            * scale
+        )
+
+    return {
+        "cls": cls,
+        "bboxes": boxes,
+    }
+
+
+# ===========================================================================
+# 3. Full training-time detection metrics
+# ===========================================================================
+
+@torch.inference_mode()
+def validate_metrics_rsdt(
     model,
     loader,
-    optimizer,
-    scaler,
     device,
     amp=True,
-    grad_clip=10.0,
-    epoch=0,
-    epochs=1,
-    rgb_high_imgsz=1280,
-    rgb_semantic_imgsz=640,
-    tir_imgsz=640,
+    conf_thres=0.001,
+    iou_thres=0.7,
+    max_det=300,
 ):
-    model.train()
+    """
+    RSD-T version of the full train_rgbt.py validation-metrics routine.
 
-    running_total_loss = 0.0
-    running_loss_items = {}
+    Returns values in [0,1]:
+        precision
+        recall
+        map50
+        map75
+        map5095
 
-    num_batches = len(
-        loader
+    This function is used by the original two-stage training engine for:
+        - epoch metrics
+        - best.pt selection
+        - early stopping
+    """
+
+    model.eval()
+
+    names = model.names
+
+    if not isinstance(
+        names,
+        dict,
+    ):
+        names = {
+            i: name
+            for i, name in enumerate(names)
+        }
+
+    names = {
+        int(k): str(v)
+        for k, v in names.items()
+    }
+
+    metrics = DetMetrics(
+        names=names
     )
+
+    iouv = torch.linspace(
+        0.50,
+        0.95,
+        10,
+        device=device,
+    )
+
+    seen = 0
+    total_instances = 0
 
     print(
         (
-            f"{'Epoch':>11}"
-            f"{'GPU_mem':>11}"
-            f"{'box_loss':>11}"
-            f"{'cls_loss':>11}"
-            f"{'dfl_loss':>11}"
+            f"{'Class':>22}"
+            f"{'Images':>11}"
             f"{'Instances':>11}"
-            f"{'Size':>19}"
+            f"{'Box(P':>11}"
+            f"{'R':>11}"
+            f"{'mAP50':>11}"
+            f"{'mAP50-95)':>13}"
         )
     )
 
     pbar = tqdm(
-        enumerate(loader),
-        total=num_batches,
+        loader,
+        total=len(loader),
         dynamic_ncols=True,
         leave=True,
+        bar_format=(
+            "{desc} "
+            "{percentage:3.0f}%|"
+            "{bar}| "
+            "{n_fmt}/{total_fmt} "
+            "[{elapsed}<{remaining}, "
+            "{rate_fmt}]"
+        ),
     )
 
-    for batch_i, batch in pbar:
+    pbar.set_description(
+        f"{'validating':>22}",
+        refresh=False,
+    )
+
+    for batch in pbar:
+
+        batch_size_current = int(
+            batch["rgb_img"].shape[0]
+        )
+
+        seen += batch_size_current
+
+        total_instances += int(
+            batch["rgb_cls"].shape[0]
+        )
 
         batch = preprocess_batch_rsdt(
             batch,
             device,
         )
 
-        optimizer.zero_grad(
-            set_to_none=True
-        )
-
-        with autocast_context(
+        with base_train.autocast_context(
             device,
             amp,
         ):
-
-            loss_raw, loss_items = model(
-                batch
+            preds = model(
+                batch["rgb_img"],
+                batch["tir_img"],
+                rgb_semantic=(
+                    batch[
+                        "rgb_semantic_img"
+                    ]
+                ),
             )
 
-            loss = loss_raw.sum()
+        preds = postprocess_predictions(
+            preds=preds,
+            model=model,
+            conf_thres=conf_thres,
+            iou_thres=iou_thres,
+            max_det=max_det,
+        )
 
-        scaler.scale(
-            loss
-        ).backward()
+        for sample_index, pred in enumerate(
+            preds
+        ):
 
-        if grad_clip > 0:
-
-            scaler.unscale_(
-                optimizer
+            gt = prepare_rsdt_ground_truth(
+                batch,
+                sample_index,
             )
 
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=grad_clip,
+            tp = process_single_image(
+                pred=pred,
+                gt=gt,
+                iouv=iouv,
             )
 
-        scaler.step(
-            optimizer
-        )
-
-        scaler.update()
-
-        loss_value = float(
-            loss.detach().item()
-        )
-
-        running_total_loss += (
-            loss_value
-        )
-
-        current_loss_items = (
-            normalize_loss_items(
-                loss_items
+            target_cls = (
+                gt["cls"]
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
             )
-        )
 
-        running_loss_items = (
-            update_running_losses(
-                running_loss_items,
-                current_loss_items,
-                batch_i,
+            if (
+                pred["cls"].shape[0]
+                == 0
+            ):
+                pred_conf = np.zeros(
+                    0,
+                    dtype=np.float32,
+                )
+
+                pred_cls = np.zeros(
+                    0,
+                    dtype=np.float32,
+                )
+            else:
+                pred_conf = (
+                    pred["conf"]
+                    .detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+
+                pred_cls = (
+                    pred["cls"]
+                    .detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+
+            metrics.update_stats(
+                {
+                    "tp": tp,
+                    "conf": pred_conf,
+                    "pred_cls": pred_cls,
+                    "target_cls": target_cls,
+                    "target_img": (
+                        np.unique(
+                            target_cls
+                        )
+                    ),
+                    "im_name": Path(
+                        batch[
+                            "rgb_path"
+                        ][sample_index]
+                    ).name,
+                }
             )
-        )
-
-        (
-            box_loss,
-            cls_loss,
-            dfl_loss,
-        ) = get_standard_losses(
-            running_loss_items
-        )
-
-        instances = int(
-            batch[
-                "rgb_cls"
-            ].shape[0]
-        )
-
-        gpu_mem = get_gpu_memory_gb(
-            device
-        )
-
-        size_str = (
-            f"{rgb_high_imgsz}/"
-            f"{rgb_semantic_imgsz}/"
-            f"{tir_imgsz}"
-        )
-
-        state = (
-            model.rsdt.scalar_state()
-        )
-
-        description = (
-            f"{epoch + 1:>5}/{epochs:<5}"
-            f"{gpu_mem:>10.3g}G"
-            f"{box_loss:>11.4g}"
-            f"{cls_loss:>11.4g}"
-            f"{dfl_loss:>11.4g}"
-            f"{instances:>11}"
-            f"{size_str:>19}"
-            f" g={state['gamma']:+.3f}"
-        )
 
         pbar.set_description(
-            description,
+            (
+                f"{'all':>22}"
+                f"{seen:>11}"
+                f"{total_instances:>11}"
+            ),
             refresh=False,
         )
 
     pbar.close()
 
-    epoch_loss = (
-        running_total_loss
-        / max(
-            num_batches,
-            1,
+    metrics.process(
+        plot=False
+    )
+
+    (
+        precision,
+        recall,
+        map50,
+        map5095,
+    ) = metrics.mean_results()
+
+    map75 = float(
+        metrics.box.map75
+    )
+
+    precision = float(
+        precision
+    )
+    recall = float(
+        recall
+    )
+    map50 = float(
+        map50
+    )
+    map5095 = float(
+        map5095
+    )
+
+    print(
+        (
+            f"{'all':>22}"
+            f"{seen:>11}"
+            f"{total_instances:>11}"
+            f"{precision:>11.3f}"
+            f"{recall:>11.3f}"
+            f"{map50:>11.3f}"
+            f"{map5095:>13.3f}"
         )
     )
 
-    return (
-        epoch_loss,
-        running_loss_items,
-    )
+    return {
+        "precision": precision,
+        "recall": recall,
+        "map50": map50,
+        "map75": map75,
+        "map5095": map5095,
+        "images": seen,
+        "instances": total_instances,
+    }
 
 
-@torch.no_grad()
-def validate_loss_rsdt(
-    model,
-    loader,
-    device,
-    amp=True,
-    epoch=0,
-    epochs=1,
+# ===========================================================================
+# 4. Dataset adapter for the original full trainer
+# ===========================================================================
+
+def build_rsdt_dataset_adapter(
+    rgb_yaml,
+    tir_yaml,
+    split="train",
+    rgb_imgsz=640,
+    tir_imgsz=640,
+    pair_mode="relative",
+    augment=False,
+    fliplr=0.5,
+    flipud=0.0,
+    tir_channels=3,
+    strict_pair=True,
+    **kwargs,
 ):
     """
-    Kept behavior-compatible with the original train_rgbt.py:
-    temporarily uses training-format raw predictions for YOLO criterion.
+    The original trainer calls build_rgbt_dataset(rgb_imgsz=...).
+
+    For RSD-T:
+        rgb_imgsz -> high-resolution RGB
+        rgb_semantic_imgsz -> read from RSD-T config
     """
 
-    model.eval()
-
-    running_loss = 0.0
-    num_batches = len(loader)
-
-    pbar = tqdm(
-        loader,
-        total=num_batches,
-        desc=f"Val   {epoch + 1}/{epochs}",
-        dynamic_ncols=True,
-        leave=True,
-    )
-
-    for batch_i, batch in enumerate(
-        pbar
-    ):
-
-        batch = preprocess_batch_rsdt(
-            batch,
-            device,
-        )
-
-        model.train()
-
-        with autocast_context(
-            device,
-            amp,
-        ):
-
-            loss_raw, _ = model(
-                batch
-            )
-
-            loss = loss_raw.sum()
-
-        model.eval()
-
-        loss_value = float(
-            loss.detach().item()
-        )
-
-        running_loss += (
-            loss_value
-        )
-
-        avg_loss = (
-            running_loss
-            / (batch_i + 1)
-        )
-
-        pbar.set_postfix(
-            {
-                "loss":
-                    f"{loss_value:.4f}",
-
-                "avg":
-                    f"{avg_loss:.4f}",
-            }
-        )
-
-    pbar.close()
-
-    return (
-        running_loss
-        / max(
-            num_batches,
-            1,
+    data_cfg = (
+        _ACTIVE_CFG
+        .get(
+            "data",
+            {},
         )
     )
 
-
-def train(
-    cfg: Dict,
-):
-    # ========================================================
-    # Basic settings
-    # ========================================================
-
-    seed = int(
-        cfg[
-            "train"
-        ].get(
-            "seed",
-            0,
-        )
-    )
-
-    deterministic = bool(
-        cfg[
-            "train"
-        ].get(
-            "deterministic",
-            True,
-        )
-    )
-
-    set_seed(
-        seed,
-        deterministic,
-    )
-
-    device = select_device(
-        str(
-            cfg[
-                "train"
-            ].get(
-                "device",
-                "0",
-            )
-        )
-    )
-
-    model_cfg = cfg[
-        "model"
-    ]
-
-    data_cfg = cfg[
-        "data"
-    ]
-
-    # ========================================================
-    # RSD-T resolutions
-    # ========================================================
-
-    rgb_high_imgsz = int(
-        data_cfg.get(
-            "rgb_high_imgsz",
-            1280,
-        )
-    )
-
-    rgb_semantic_imgsz = int(
+    semantic_imgsz = int(
         data_cfg.get(
             "rgb_semantic_imgsz",
             640,
         )
     )
 
-    tir_imgsz = int(
-        data_cfg.get(
-            "tir_imgsz",
-            640,
-        )
-    )
-
-    rgb_yaml = data_cfg[
-        "rgb"
-    ]
-
-    tir_yaml = data_cfg[
-        "tir"
-    ]
-
-    pair_mode = data_cfg.get(
-        "pair_mode",
-        "relative",
-    )
-
-    print(
-        "\n"
-        "============================================================"
-    )
-
-    print(
-        "RGB-T + RSD-T v1 Training"
-    )
-
-    print(
-        "============================================================"
-    )
-
-    print(
-        f"Device          : {device}"
-    )
-
-    print(
-        f"RGB high        : {rgb_high_imgsz}"
-    )
-
-    print(
-        f"RGB semantic    : {rgb_semantic_imgsz}"
-    )
-
-    print(
-        f"TIR             : {tir_imgsz}"
-    )
-
-    print(
-        f"Guidance        : "
-        f"{model_cfg.get('use_guidance', True)}"
-    )
-
-    # ========================================================
-    # Output
-    # ========================================================
-
-    project = Path(
-        cfg[
-            "output"
-        ].get(
-            "project",
-            ROOT / "runs/rsdt",
-        )
-    )
-
-    if not project.is_absolute():
-        project = (
-            ROOT / project
-        )
-
-    run_name = cfg[
-        "output"
-    ].get(
-        "name",
-        "rsdt_exp",
-    )
-
-    save_dir = (
-        project
-        / run_name
-    ).resolve()
-
-    weights_dir = (
-        save_dir
-        / "weights"
-    )
-
-    weights_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    save_config(
-        cfg,
-        save_dir
-        / "config.yaml",
-    )
-
-    # ========================================================
-    # Datasets
-    # ========================================================
-
-    augment_cfg = cfg.get(
-        "augment",
-        {},
-    )
-
-    train_dataset = build_rsdt_dataset(
+    return build_rsdt_dataset(
         rgb_yaml=rgb_yaml,
         tir_yaml=tir_yaml,
-        split="train",
-        rgb_high_imgsz=rgb_high_imgsz,
+        split=split,
+        rgb_high_imgsz=rgb_imgsz,
         rgb_semantic_imgsz=(
-            rgb_semantic_imgsz
+            semantic_imgsz
         ),
         tir_imgsz=tir_imgsz,
         pair_mode=pair_mode,
-        augment=True,
-        fliplr=float(
-            augment_cfg.get(
-                "fliplr",
-                0.5,
+        augment=augment,
+        fliplr=fliplr,
+        flipud=flipud,
+        tir_channels=tir_channels,
+        strict_pair=strict_pair,
+    )
+
+
+# ===========================================================================
+# 5. Model adapter for the original full trainer
+# ===========================================================================
+
+def build_rsdt_model_adapter(
+    model_name="yolo26n",
+    nc=1,
+    pretrained=True,
+    fusion="concat",
+    fusion_indices=None,
+    align_mode="bilinear",
+    names=None,
+    verbose=True,
+    **kwargs,
+):
+    model_cfg = (
+        _ACTIVE_CFG
+        .get(
+            "model",
+            {},
+        )
+    )
+
+    data_cfg = (
+        _ACTIVE_CFG
+        .get(
+            "data",
+            {},
+        )
+    )
+
+    return RGBTRSDTDetectionModel(
+        model_name=model_name,
+        nc=nc,
+        pretrained=pretrained,
+        fusion=fusion,
+        fusion_indices=fusion_indices,
+        align_mode=align_mode,
+        names=names,
+
+        semantic_imgsz=int(
+            data_cfg.get(
+                "rgb_semantic_imgsz",
+                640,
             )
-        ),
-        flipud=float(
-            augment_cfg.get(
-                "flipud",
-                0.0,
-            )
-        ),
-        tir_channels=3,
-        strict_pair=True,
-    )
-
-    val_dataset = build_rsdt_dataset(
-        rgb_yaml=rgb_yaml,
-        tir_yaml=tir_yaml,
-        split="val",
-        rgb_high_imgsz=rgb_high_imgsz,
-        rgb_semantic_imgsz=(
-            rgb_semantic_imgsz
-        ),
-        tir_imgsz=tir_imgsz,
-        pair_mode=pair_mode,
-        augment=False,
-        tir_channels=3,
-        strict_pair=True,
-    )
-
-    batch_size = int(
-        cfg[
-            "train"
-        ].get(
-            "batch",
-            4,
-        )
-    )
-
-    workers = int(
-        cfg[
-            "train"
-        ].get(
-            "workers",
-            4,
-        )
-    )
-
-    train_loader = (
-        build_rsdt_dataloader(
-            train_dataset,
-            batch_size=batch_size,
-            workers=workers,
-            shuffle=True,
-            pin_memory=(
-                device.type
-                == "cuda"
-            ),
-        )
-    )
-
-    val_loader = (
-        build_rsdt_dataloader(
-            val_dataset,
-            batch_size=batch_size,
-            workers=workers,
-            shuffle=False,
-            pin_memory=(
-                device.type
-                == "cuda"
-            ),
-        )
-    )
-
-    # ========================================================
-    # Model
-    # ========================================================
-
-    model = RGBTRSDTDetectionModel(
-        model_name=model_cfg.get(
-            "name",
-            "yolo26n",
-        ),
-
-        nc=train_dataset.nc,
-
-        pretrained=bool(
-            model_cfg.get(
-                "pretrained",
-                True,
-            )
-        ),
-
-        fusion=model_cfg.get(
-            "fusion",
-            "concat",
-        ),
-
-        align_mode=model_cfg.get(
-            "align_mode",
-            "bilinear",
-        ),
-
-        names=train_dataset.names,
-
-        semantic_imgsz=(
-            rgb_semantic_imgsz
         ),
 
         use_guidance=bool(
@@ -677,315 +595,254 @@ def train(
             )
         ),
 
-        verbose=True,
+        verbose=verbose,
     )
 
-    model = model.to(
-        device
+
+# ===========================================================================
+# 6. Optional training progress wrapper
+# ===========================================================================
+
+_ORIGINAL_TRAIN_ONE_EPOCH = (
+    base_train.train_one_epoch
+)
+
+
+def train_one_epoch_rsdt(
+    *args,
+    **kwargs,
+):
+    """
+    Keep the complete original train-one-epoch logic.
+    Only the displayed resolution string is handled by the original
+    high-RGB/TIR fields. gamma/alpha are printed after every epoch by
+    the stage wrapper below.
+    """
+
+    return _ORIGINAL_TRAIN_ONE_EPOCH(
+        *args,
+        **kwargs,
     )
 
-    configure_model_loss(
-        model,
-        cfg,
-    )
 
-    model.print_info()
+# ===========================================================================
+# 7. Stage wrapper: keep original behavior + print RSD-T scalar state
+# ===========================================================================
 
-    # ========================================================
-    # Optimizer / scheduler / AMP
-    # ========================================================
+_ORIGINAL_RUN_TRAINING_STAGE = (
+    base_train.run_training_stage
+)
 
-    optimizer = build_optimizer(
-        model,
-        cfg,
-    )
 
-    scheduler = build_scheduler(
-        optimizer,
-        cfg,
-    )
+def run_training_stage_rsdt(
+    *args,
+    **kwargs,
+):
+    """
+    Delegates the COMPLETE stage implementation to the old trainer:
+        best mAP selection
+        early stopping
+        history
+        checkpoints
+        two-stage bookkeeping
 
-    amp = bool(
-        cfg[
-            "train"
-        ].get(
-            "amp",
-            True,
+    Adds final RSD-T scalar reporting.
+    """
+
+    result = (
+        _ORIGINAL_RUN_TRAINING_STAGE(
+            *args,
+            **kwargs,
         )
     )
 
-    scaler = build_scaler(
-        amp,
-        device,
-    )
-
-    # ========================================================
-    # Resume
-    # ========================================================
-
-    start_epoch = 0
-
-    best_val_loss = float(
-        "inf"
-    )
-
-    resume = cfg[
-        "train"
-    ].get(
-        "resume",
+    model = kwargs.get(
+        "model",
         None,
     )
 
-    if resume:
-
-        (
-            start_epoch,
-            best_val_loss,
-        ) = resume_checkpoint(
-            resume,
+    if (
+        model is not None
+        and hasattr(
             model,
-            optimizer,
-            scheduler,
-            scaler,
-            device,
+            "rsdt",
         )
-
-    # ========================================================
-    # Loop
-    # ========================================================
-
-    epochs = int(
-        cfg[
-            "train"
-        ].get(
-            "epochs",
-            300,
-        )
-    )
-
-    grad_clip = float(
-        cfg[
-            "train"
-        ].get(
-            "grad_clip",
-            10.0,
-        )
-    )
-
-    history = []
-
-    for epoch in range(
-        start_epoch,
-        epochs,
     ):
-
-        (
-            train_loss,
-            train_loss_items,
-        ) = train_one_epoch_rsdt(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            scaler=scaler,
-            device=device,
-            amp=amp,
-            grad_clip=grad_clip,
-            epoch=epoch,
-            epochs=epochs,
-            rgb_high_imgsz=(
-                rgb_high_imgsz
-            ),
-            rgb_semantic_imgsz=(
-                rgb_semantic_imgsz
-            ),
-            tir_imgsz=tir_imgsz,
-        )
-
-        val_loss = validate_loss_rsdt(
-            model=model,
-            loader=val_loader,
-            device=device,
-            amp=amp,
-            epoch=epoch,
-            epochs=epochs,
-        )
-
-        scheduler.step()
-
-        current_lr = (
-            optimizer.param_groups[
-                0
-            ]["lr"]
-        )
-
-        (
-            train_box_loss,
-            train_cls_loss,
-            train_dfl_loss,
-        ) = get_standard_losses(
-            train_loss_items
-        )
-
-        rsdt_state = (
+        state = (
             model.rsdt.scalar_state()
         )
 
         print(
-            f"\nEpoch {epoch + 1}:"
+            "\nRSD-T state:"
         )
 
         print(
-            f"  train_loss = "
-            f"{train_loss:.6f}"
+            f"  alpha = "
+            f"{state['alpha']:.6f}"
         )
 
         print(
-            f"  box_loss   = "
-            f"{train_box_loss:.6f}"
+            f"  gamma = "
+            f"{state['gamma']:.6f}"
         )
 
-        print(
-            f"  cls_loss   = "
-            f"{train_cls_loss:.6f}"
-        )
+    return result
 
-        print(
-            f"  dfl_loss   = "
-            f"{train_dfl_loss:.6f}"
-        )
 
-        print(
-            f"  val_loss   = "
-            f"{val_loss:.6f}"
-        )
+# ===========================================================================
+# 8. Install adapters into the imported full trainer
+# ===========================================================================
 
-        print(
-            f"  alpha      = "
-            f"{rsdt_state['alpha']:.6f}"
-        )
+def install_rsdt_adapters(
+    cfg: Dict,
+):
+    """
+    Patches only the in-memory imported train_rgbt module.
 
-        print(
-            f"  gamma      = "
-            f"{rsdt_state['gamma']:.6f}"
-        )
+    NO source file is changed on disk.
+    Starting a normal:
+        python train_rgbt.py ...
+    process remains completely unaffected.
+    """
 
-        record = {
-            "epoch":
-                epoch + 1,
+    global _ACTIVE_CFG
 
-            "train_loss":
-                train_loss,
+    _ACTIVE_CFG = cfg
 
-            "box_loss":
-                train_box_loss,
+    # Allow either spelling in experiment YAML.
+    data_cfg = cfg.setdefault(
+        "data",
+        {},
+    )
 
-            "cls_loss":
-                train_cls_loss,
-
-            "dfl_loss":
-                train_dfl_loss,
-
-            "val_loss":
-                val_loss,
-
-            "lr":
-                current_lr,
-
-            "rsdt_alpha":
-                rsdt_state[
-                    "alpha"
-                ],
-
-            "rsdt_gamma":
-                rsdt_state[
-                    "gamma"
-                ],
-        }
-
-        history.append(
-            record
-        )
-
-        with (
-            save_dir
-            / "history.json"
-        ).open(
-            "w",
-            encoding="utf-8",
-        ) as f:
-
-            json.dump(
-                history,
-                f,
-                indent=2,
+    if (
+        "rgb_imgsz"
+        not in data_cfg
+    ):
+        data_cfg[
+            "rgb_imgsz"
+        ] = int(
+            data_cfg.get(
+                "rgb_high_imgsz",
+                1280,
             )
-
-        save_checkpoint(
-            weights_dir
-            / "last.pt",
-
-            model,
-            optimizer,
-            scheduler,
-            scaler,
-            epoch,
-            best_val_loss,
-            cfg,
         )
 
-        if val_loss < best_val_loss:
+    data_cfg.setdefault(
+        "rgb_semantic_imgsz",
+        640,
+    )
 
-            best_val_loss = (
-                val_loss
-            )
+    # RSD-T dataset / loader.
+    base_train.build_rgbt_dataset = (
+        build_rsdt_dataset_adapter
+    )
 
-            save_checkpoint(
-                weights_dir
-                / "best.pt",
+    base_train.build_rgbt_dataloader = (
+        build_rsdt_dataloader
+    )
 
-                model,
-                optimizer,
-                scheduler,
-                scaler,
-                epoch,
-                best_val_loss,
-                cfg,
-            )
+    # RSD-T model.
+    base_train.RGBTDetectionModel = (
+        build_rsdt_model_adapter
+    )
 
-            print(
-                f"  [BEST] "
-                f"val_loss="
-                f"{best_val_loss:.6f}"
-            )
+    # RSD-T batch structure.
+    base_train.preprocess_batch = (
+        preprocess_batch_rsdt
+    )
 
-    print(
-        "\nTraining completed."
+    # Full train epoch remains original.
+    base_train.train_one_epoch = (
+        train_one_epoch_rsdt
+    )
+
+    # Training-time metrics need 3-input inference
+    # and semantic-coordinate GT.
+    base_train.validate_metrics = (
+        validate_metrics_rsdt
+    )
+
+    # Keep complete original stage implementation,
+    # wrapped only for RSD-T state reporting.
+    base_train.run_training_stage = (
+        run_training_stage_rsdt
+    )
+
+
+# ===========================================================================
+# 9. Main
+# ===========================================================================
+
+def train(
+    cfg: Dict,
+):
+    """
+    Use the original FULL train_rgbt.train() after installing in-memory
+    RSD-T adapters.
+    """
+
+    install_rsdt_adapters(
+        cfg
     )
 
     print(
-        f"Save dir: {save_dir}"
+        "\n"
+        "============================================================"
+    )
+    print(
+        "RSD-T full-feature training"
+    )
+    print(
+        "Base engine     : train_rgbt.py"
+    )
+    print(
+        "Original files  : unchanged"
+    )
+    print(
+        f"RGB high        : "
+        f"{cfg['data']['rgb_imgsz']}"
+    )
+    print(
+        f"RGB semantic    : "
+        f"{cfg['data']['rgb_semantic_imgsz']}"
+    )
+    print(
+        f"TIR             : "
+        f"{cfg['data'].get('tir_imgsz', 640)}"
+    )
+    print(
+        "============================================================\n"
     )
 
-
-def main():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--cfg",
-        type=str,
-        required=True,
-    )
-
-    args = parser.parse_args()
-
-    cfg = load_config(
-        args.cfg
-    )
-
-    train(
+    return base_train.train(
         cfg
     )
 
 
 if __name__ == "__main__":
-    main()
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Full-feature isolated RSD-T training"
+        )
+    )
+
+    parser.add_argument(
+        "--cfg",
+        type=str,
+        required=True,
+        help="RSD-T experiment YAML",
+    )
+
+    args = parser.parse_args()
+
+    config = (
+        base_train.load_config(
+            args.cfg
+        )
+    )
+
+    train(
+        config
+    )
