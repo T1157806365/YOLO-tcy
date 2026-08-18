@@ -30,14 +30,14 @@ Current task:
     conda activate tcy
     cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
     python val_rgbt.py \
-    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rgbt/yolo26n_uavcb_rgbt_add_960_b12_seed0/weights/best.pt \
+    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rgbt/yolo26n_uavcb_rgbt_concat_1280_b8_seed0/weights/best.pt \
     --rgb /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml \
     --tir /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml \
     --split test \
-    --rgb-imgsz 960 \
+    --rgb-imgsz 1280 \
     --tir-imgsz 640 \
     --batch 4 \
-    --device 5
+    --device 3
 """
 
 from __future__ import annotations

@@ -1,25 +1,37 @@
 """
-RGB-T + RSD-T v1 Detection Model
-================================
-Zero-intrusion extension of models/rgbt_model.py.
+Configurable Multi-Scale RGB-T + RSD-T Detection Model
+======================================================
 
-The original RGBTDetectionModel is NOT modified.
+Zero-intrusion extension of:
+    models/rgbt_model.py
 
-Inheritance:
-    RGBTDetectionModel
-        ↓
-    RGBTRSDTDetectionModel
+Original RGB-T model is not modified.
 
-Only one behavior changes:
-    before the original RGB-T fusion, RGB P3 is enhanced by RSD-T v1.
+YAML control:
+    rsdt_scales: [3]
+    rsdt_scales: [4]
+    rsdt_scales: [5]
+    rsdt_scales: [3, 4]
+    rsdt_scales: [3, 4, 5]
 
-P4/P5, original fusion, YOLO neck, detect head and loss implementation style
-remain inherited/reused.
+Scale mapping:
+    P3 -> fusion_indices[0]
+    P4 -> fusion_indices[1]
+    P5 -> fusion_indices[2]
+
+The shared high-resolution DetailStem runs only once.
+Each selected scale has an independent guidance/injection adapter.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Union
+from typing import (
+    Dict,
+    Iterable,
+    Optional,
+    Sequence,
+    Union,
+)
 
 import torch
 import torch.nn.functional as F
@@ -29,39 +41,26 @@ from models.rgbt_model import (
 )
 
 from models.modules.rsd_t_v1 import (
-    RSDTv1,
+    MultiScaleRSDTv1,
 )
 
 
 class RGBTRSDTDetectionModel(
     RGBTDetectionModel
 ):
-    """
-    RGB-T detector with RSD-T v1.
-
-    Inputs:
-        rgb            : high-resolution RGB
-        tir            : TIR
-        rgb_semantic   : low-resolution RGB for full RGB backbone
-
-    Architecture:
-        rgb_semantic -> RGB backbone -> RGB P3/P4/P5
-        tir          -> TIR backbone -> TIR P3/P4/P5
-        rgb_high + RGB P3 + TIR P3 -> RSD-T -> enhanced RGB P3
-        enhanced RGB P3/P4/P5 + TIR -> original fusion
-        -> original YOLO neck + detect
-    """
-
     def __init__(
         self,
         model_name: str = "yolo26n",
         nc: int = 1,
         pretrained: bool = True,
         fusion: str = "concat",
+
         fusion_indices: Optional[
             Sequence[int]
         ] = None,
+
         align_mode: str = "bilinear",
+
         names: Optional[
             Union[
                 Dict[int, str],
@@ -71,6 +70,11 @@ class RGBTRSDTDetectionModel(
 
         semantic_imgsz: int = 640,
 
+        # -----------------------------------------------------
+        # New configurable scale selector
+        # -----------------------------------------------------
+        rsdt_scales: Iterable[int] = (3,),
+
         use_guidance: bool = True,
 
         detail_channels: int = 64,
@@ -79,7 +83,10 @@ class RGBTRSDTDetectionModel(
 
         verbose: bool = True,
     ):
-        # Build the original RGB-T model unchanged.
+        # -----------------------------------------------------
+        # Original RGB-T detector
+        # -----------------------------------------------------
+
         super().__init__(
             model_name=model_name,
             nc=nc,
@@ -99,42 +106,119 @@ class RGBTRSDTDetectionModel(
             use_guidance
         )
 
-        # Standard YOLO11/YOLO26 current repository returns
-        # [P3, P4, P5] in ascending fusion_indices.
-        if not self.fusion_indices:
-            raise RuntimeError(
-                "RSD-T requires at least one fusion index."
+        self.rsdt_scales = tuple(
+            sorted(
+                {
+                    int(s)
+                    for s in rsdt_scales
+                }
             )
-
-        self.rsdt_index = int(
-            self.fusion_indices[0]
         )
 
-        # Infer P3 channels from the actual model, avoiding hard coding.
+        if not self.rsdt_scales:
+            raise ValueError(
+                "rsdt_scales 不能为空。"
+            )
+
+        invalid = [
+            s
+            for s in self.rsdt_scales
+            if s not in (
+                3,
+                4,
+                5,
+            )
+        ]
+
+        if invalid:
+            raise ValueError(
+                "rsdt_scales 只能包含 3/4/5，"
+                f"当前非法值={invalid}"
+            )
+
+        # -----------------------------------------------------
+        # Current RGBTDetectionModel exposes its three pyramid
+        # fusion locations in P3/P4/P5 order.
+        # -----------------------------------------------------
+
+        if len(
+            self.fusion_indices
+        ) < 3:
+            raise RuntimeError(
+                "Multi-scale RSD-T requires "
+                "P3/P4/P5 fusion indices."
+            )
+
+        self.rsdt_scale_to_index = {
+            3:
+                int(
+                    self.fusion_indices[
+                        0
+                    ]
+                ),
+
+            4:
+                int(
+                    self.fusion_indices[
+                        1
+                    ]
+                ),
+
+            5:
+                int(
+                    self.fusion_indices[
+                        2
+                    ]
+                ),
+        }
+
+        # -----------------------------------------------------
+        # Infer actual channels, no hard coding.
+        # -----------------------------------------------------
+
         feature_channels = (
             self._infer_feature_channels()
         )
 
-        rgb_p3_channels = int(
-            feature_channels[
-                self.rsdt_index
-            ]["rgb"]
-        )
+        rgb_channels = {}
+        tir_channels = {}
 
-        tir_p3_channels = int(
-            feature_channels[
-                self.rsdt_index
-            ]["tir"]
-        )
+        for scale in self.rsdt_scales:
 
-        self.rsdt = RSDTv1(
-            rgb_p3_channels=(
-                rgb_p3_channels
-            ),
+            index = (
+                self.rsdt_scale_to_index[
+                    scale
+                ]
+            )
 
-            tir_p3_channels=(
-                tir_p3_channels
-            ),
+            rgb_channels[
+                scale
+            ] = int(
+                feature_channels[
+                    index
+                ][
+                    "rgb"
+                ]
+            )
+
+            tir_channels[
+                scale
+            ] = int(
+                feature_channels[
+                    index
+                ][
+                    "tir"
+                ]
+            )
+
+        # -----------------------------------------------------
+        # Shared DetailStem + per-scale adapters
+        # -----------------------------------------------------
+
+        self.rsdt = MultiScaleRSDTv1(
+            rgb_channels=rgb_channels,
+            tir_channels=tir_channels,
+            scales=self.rsdt_scales,
 
             detail_channels=int(
                 detail_channels
@@ -156,49 +240,47 @@ class RGBTRSDTDetectionModel(
         )
 
         if verbose:
-
             print(
                 "\n"
                 "============================================================"
             )
-
             print(
-                "Enable isolated RSD-T v1"
+                "Enable configurable Multi-Scale RSD-T v1"
             )
-
             print(
                 "============================================================"
             )
-
             print(
-                f"RSD-T P3 layer : "
-                f"{self.rsdt_index}"
+                f"RSD-T scales    : "
+                f"{list(self.rsdt_scales)}"
             )
+
+            for scale in self.rsdt_scales:
+                print(
+                    f"P{scale} layer       : "
+                    f"{self.rsdt_scale_to_index[scale]}"
+                )
+
+                print(
+                    f"P{scale} RGB/TIR C   : "
+                    f"{rgb_channels[scale]}/"
+                    f"{tir_channels[scale]}"
+                )
 
             print(
                 f"RGB semantic   : "
                 f"{self.semantic_imgsz}"
             )
-
             print(
                 f"Guidance       : "
                 f"{self.use_guidance}"
             )
-
             print(
-                f"RGB P3 C       : "
-                f"{rgb_p3_channels}"
+                "Shared DetailStem: 1x"
             )
-
             print(
-                f"TIR P3 C       : "
-                f"{tir_p3_channels}"
+                "gamma init      : 0.0 per scale"
             )
-
-            print(
-                "gamma init      : 0.0"
-            )
-
             print(
                 "============================================================\n"
             )
@@ -211,12 +293,6 @@ class RGBTRSDTDetectionModel(
         self,
         rgb_high: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Only used for dummy model tests / FLOPs / FPS when a separate
-        dataset-generated semantic RGB is unavailable.
-
-        Formal training and validation should always pass rgb_semantic.
-        """
 
         if (
             rgb_high.shape[-2:]
@@ -238,16 +314,18 @@ class RGBTRSDTDetectionModel(
         )
 
     # ========================================================
-    # Feature forward
+    # Forward features
     # ========================================================
 
     def forward_features(
         self,
         rgb: torch.Tensor,
         tir: torch.Tensor,
+
         rgb_semantic: Optional[
             torch.Tensor
         ] = None,
+
         return_rsdt_debug: bool = False,
     ) -> Dict:
 
@@ -258,61 +336,111 @@ class RGBTRSDTDetectionModel(
                 )
             )
 
-        # Full RGB backbone runs ONLY on low-resolution semantic RGB.
+        # -----------------------------------------------------
+        # Original two full semantic backbones
+        # -----------------------------------------------------
+
         rgb_outputs = list(
             self.forward_rgb_backbone(
                 rgb_semantic
             )
         )
 
-        # TIR branch remains the original full backbone.
-        tir_outputs = (
+        tir_outputs = list(
             self.forward_tir_backbone(
                 tir
             )
         )
 
-        rgb_p3 = rgb_outputs[
-            self.rsdt_index
-        ]
+        # -----------------------------------------------------
+        # Build only selected scale feature dictionaries.
+        # -----------------------------------------------------
 
-        tir_p3 = tir_outputs[
-            self.rsdt_index
-        ]
+        rgb_scale_features = {}
+        tir_scale_features = {}
+
+        for scale in self.rsdt_scales:
+
+            index = (
+                self.rsdt_scale_to_index[
+                    scale
+                ]
+            )
+
+            rgb_scale_features[
+                scale
+            ] = rgb_outputs[
+                index
+            ]
+
+            tir_scale_features[
+                scale
+            ] = tir_outputs[
+                index
+            ]
 
         rsdt_debug = None
+
+        # -----------------------------------------------------
+        # Shared high-resolution detail + selected scales
+        # -----------------------------------------------------
 
         if return_rsdt_debug:
 
             (
-                enhanced_rgb_p3,
+                enhanced_features,
                 rsdt_debug,
             ) = self.rsdt(
                 rgb_high=rgb,
-                rgb_semantic=rgb_semantic,
-                rgb_p3=rgb_p3,
-                tir_p3=tir_p3,
+                rgb_semantic=(
+                    rgb_semantic
+                ),
+                rgb_features=(
+                    rgb_scale_features
+                ),
+                tir_features=(
+                    tir_scale_features
+                ),
                 return_debug=True,
             )
 
         else:
 
-            enhanced_rgb_p3 = (
-                self.rsdt(
-                    rgb_high=rgb,
-                    rgb_semantic=rgb_semantic,
-                    rgb_p3=rgb_p3,
-                    tir_p3=tir_p3,
-                    return_debug=False,
-                )
+            enhanced_features = self.rsdt(
+                rgb_high=rgb,
+                rgb_semantic=rgb_semantic,
+                rgb_features=(
+                    rgb_scale_features
+                ),
+                tir_features=(
+                    tir_scale_features
+                ),
+                return_debug=False,
             )
 
-        # Only P3 is replaced.
-        rgb_outputs[
-            self.rsdt_index
-        ] = enhanced_rgb_p3
+        # -----------------------------------------------------
+        # Replace ONLY selected RGB pyramid levels.
+        # Non-selected levels remain exactly original.
+        # -----------------------------------------------------
 
-        # Original RGB-T P3/P4/P5 fusion is reused unchanged.
+        for scale in self.rsdt_scales:
+
+            index = (
+                self.rsdt_scale_to_index[
+                    scale
+                ]
+            )
+
+            rgb_outputs[
+                index
+            ] = enhanced_features[
+                scale
+            ]
+
+        # -----------------------------------------------------
+        # Original final RGB-T fusion stays unchanged.
+        # -----------------------------------------------------
+
         (
             fused_outputs,
             fusion_features,
@@ -337,12 +465,16 @@ class RGBTRSDTDetectionModel(
             "rgb_semantic":
                 rgb_semantic,
 
-            "rsdt_index":
-                self.rsdt_index,
+            "rsdt_scales":
+                self.rsdt_scales,
+
+            "rsdt_scale_to_index":
+                dict(
+                    self.rsdt_scale_to_index
+                ),
         }
 
         if return_rsdt_debug:
-
             result[
                 "rsdt_debug"
             ] = rsdt_debug
@@ -357,9 +489,11 @@ class RGBTRSDTDetectionModel(
         self,
         rgb: torch.Tensor,
         tir: torch.Tensor,
+
         rgb_semantic: Optional[
             torch.Tensor
         ] = None,
+
         return_features: bool = False,
         return_rsdt_debug: bool = False,
     ):
@@ -367,7 +501,9 @@ class RGBTRSDTDetectionModel(
         features = self.forward_features(
             rgb,
             tir,
+
             rgb_semantic=rgb_semantic,
+
             return_rsdt_debug=(
                 return_rsdt_debug
             ),
@@ -383,7 +519,6 @@ class RGBTRSDTDetectionModel(
             return_features
             or return_rsdt_debug
         ):
-
             return {
                 "pred":
                     pred,
@@ -406,18 +541,15 @@ class RGBTRSDTDetectionModel(
         return_rsdt_debug: bool = False,
     ):
 
-        # Training batch
         if isinstance(
             rgb,
             dict,
         ):
-
             return self.loss(
                 rgb
             )
 
         if tir is None:
-
             raise ValueError(
                 "RSD-T model requires both RGB and TIR."
             )
@@ -425,10 +557,13 @@ class RGBTRSDTDetectionModel(
         return self.predict(
             rgb,
             tir,
+
             rgb_semantic=rgb_semantic,
+
             return_features=(
                 return_features
             ),
+
             return_rsdt_debug=(
                 return_rsdt_debug
             ),
@@ -444,13 +579,8 @@ class RGBTRSDTDetectionModel(
         preds=None,
     ):
         """
-        Final prediction belongs to the 640 semantic-RGB reference grid.
-
-        Therefore:
-            img     = rgb_semantic_img
-            bboxes  = rgb_semantic_bboxes
-
-        High-resolution RGB labels are NOT used by the final head.
+        Detection head stays in semantic-RGB coordinates.
+        This is independent of whether P3/P4/P5 are enhanced.
         """
 
         required = [
@@ -464,21 +594,17 @@ class RGBTRSDTDetectionModel(
         ]
 
         for key in required:
-
             if key not in batch:
-
                 raise KeyError(
                     f"RSD-T batch missing: {key}"
                 )
 
         if self.criterion is None:
-
             self.criterion = (
                 self.init_criterion()
             )
 
         if preds is None:
-
             preds = self.predict(
                 batch[
                     "rgb_img"
@@ -523,7 +649,7 @@ class RGBTRSDTDetectionModel(
         )
 
     # ========================================================
-    # Info
+    # Information
     # ========================================================
 
     def print_info(
@@ -532,33 +658,42 @@ class RGBTRSDTDetectionModel(
 
         super().print_info()
 
-        state = self.rsdt.scalar_state()
-
-        print(
-            "RSD-T v1:"
+        state = (
+            self.rsdt.scalar_state()
         )
 
         print(
-            f"  P3 layer       : "
-            f"{self.rsdt_index}"
+            "Multi-Scale RSD-T v1:"
         )
 
         print(
-            f"  semantic imgsz : "
+            f"  scales          : "
+            f"{list(self.rsdt_scales)}"
+        )
+
+        print(
+            f"  semantic imgsz  : "
             f"{self.semantic_imgsz}"
         )
 
         print(
-            f"  guidance       : "
+            f"  guidance        : "
             f"{self.use_guidance}"
         )
 
         print(
-            f"  alpha          : "
-            f"{state['alpha']:.6f}"
+            "  shared detail   : "
+            "DetailStem x1"
         )
 
-        print(
-            f"  gamma          : "
-            f"{state['gamma']:.6f}"
-        )
+        for scale in self.rsdt_scales:
+
+            print(
+                f"  P{scale} alpha       : "
+                f"{state[f'alpha_p{scale}']:.6f}"
+            )
+
+            print(
+                f"  P{scale} gamma       : "
+                f"{state[f'gamma_p{scale}']:.6f}"
+            )

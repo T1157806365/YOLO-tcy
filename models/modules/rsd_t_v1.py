@@ -1,38 +1,68 @@
 """
-RSD-T v1
-========
-Thermal-Guided Resolution Semantic-Detail Enhancement Module.
+Configurable Multi-Scale RSD-T v1
+=================================
 
-Zero-intrusion component for YOLO-tcy.
+Purpose
+-------
+Allow RSD-T to be inserted at any combination of:
+    P3
+    P4
+    P5
 
-Inputs:
-    rgb_high      : high-resolution RGB image tensor
-    rgb_semantic  : low-resolution RGB semantic image tensor
-    rgb_p3        : RGB P3 semantic feature
-    tir_p3        : TIR P3 semantic feature
+without changing Python code.
 
-Output:
-    enhanced RGB P3 feature
+Example YAML:
+    rsdt_scales: [3]
+    rsdt_scales: [4]
+    rsdt_scales: [5]
+    rsdt_scales: [3, 4]
+    rsdt_scales: [3, 4, 5]
 
-Core:
-    delta = rgb_high - U(rgb_semantic)
-    D = DetailStem(delta)
-    A = sigmoid(Guidance(rgb_p3, tir_p3))
-    D* = D * (1 + alpha * U(A))
-    D3 = Project(AvgPool(D*) || MaxPool(D*))
-    P3* = P3 + gamma * D3
+Design
+------
+The expensive/high-resolution part is SHARED:
 
-gamma is initialized to zero, so P3* == P3 at initialization.
+    RGB-high + RGB-semantic
+        -> resolution residual
+        -> DetailStem
+        -> D_R
+
+D_R is computed ONCE.
+
+Each selected scale owns an independent adapter:
+
+    RGB P_s + TIR P_s
+        -> Guidance_s
+        -> A_s
+
+    D_R + A_s
+        -> soft enhancement
+        -> adaptive AvgPool + MaxPool
+        -> scale-specific projection
+        -> D_s
+
+    P_s* = P_s + gamma_s * D_s
+
+Thus:
+    DetailStem            : shared
+    Guidance Generator    : scale-specific
+    alpha_s               : scale-specific
+    gamma_s               : scale-specific
+    detail projection     : scale-specific
 """
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict, Iterable, Mapping, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+# ===========================================================================
+# Basic blocks
+# ===========================================================================
 
 class ConvBNAct(nn.Module):
     def __init__(
@@ -72,10 +102,13 @@ class ConvBNAct(nn.Module):
 
 class DetailStem(nn.Module):
     """
-    Lightweight /8 high-resolution detail encoder.
+    Shared high-resolution shallow detail encoder.
 
     Example:
-        1280 -> 640 -> 320 -> 160
+        1280
+          -> 640
+          -> 320
+          -> 160
     """
 
     def __init__(
@@ -132,7 +165,7 @@ class DetailStem(nn.Module):
                 groups=mid_channels,
             ),
 
-            # detail embedding
+            # shared detail embedding
             ConvBNAct(
                 mid_channels,
                 detail_channels,
@@ -150,10 +183,14 @@ class DetailStem(nn.Module):
 
 class GuidanceGenerator(nn.Module):
     """
-    RGB P3 + TIR P3 -> spatial guidance A.
+    Scale-specific RGB-T semantic guidance generator.
 
-    A is not a segmentation mask.
-    It is a soft importance map for high-resolution RGB detail.
+        RGB P_s -> 1x1 projection --\
+                                    -> concat -> 3x3 -> 1x1 -> sigmoid
+        TIR P_s -> 1x1 projection --/
+
+    Output:
+        A_s: [B, 1, H_s, W_s]
     """
 
     def __init__(
@@ -185,6 +222,7 @@ class GuidanceGenerator(nn.Module):
                 kernel_size=3,
                 stride=1,
             ),
+
             nn.Conv2d(
                 guide_channels,
                 1,
@@ -216,24 +254,24 @@ class GuidanceGenerator(nn.Module):
 
     def forward(
         self,
-        rgb_p3: torch.Tensor,
-        tir_p3: torch.Tensor,
+        rgb_feat: torch.Tensor,
+        tir_feat: torch.Tensor,
     ) -> torch.Tensor:
 
-        tir_p3 = self._resize_like(
-            tir_p3,
-            rgb_p3,
+        tir_feat = self._resize_like(
+            tir_feat,
+            rgb_feat,
         )
 
         rgb_g = self.rgb_proj(
-            rgb_p3
+            rgb_feat
         )
 
         tir_g = self.tir_proj(
-            tir_p3
+            tir_feat
         )
 
-        x = torch.cat(
+        fused = torch.cat(
             [
                 rgb_g,
                 tir_g,
@@ -242,15 +280,345 @@ class GuidanceGenerator(nn.Module):
         )
 
         return torch.sigmoid(
-            self.fuse(x)
+            self.fuse(
+                fused
+            )
         )
 
 
-class RSDTv1(nn.Module):
+# ===========================================================================
+# One scale adapter
+# ===========================================================================
+
+class RSDTScaleAdapter(nn.Module):
+    """
+    One independent RSD-T adapter for one pyramid level.
+
+    Example:
+        scale = P3 / P4 / P5
+
+    Shared D_R comes from MultiScaleRSDTv1.detail_stem.
+    """
+
     def __init__(
         self,
-        rgb_p3_channels: int,
-        tir_p3_channels: int,
+        rgb_channels: int,
+        tir_channels: int,
+        detail_channels: int,
+        guide_channels: int = 32,
+        use_guidance: bool = True,
+    ):
+        super().__init__()
+
+        self.rgb_channels = int(
+            rgb_channels
+        )
+
+        self.tir_channels = int(
+            tir_channels
+        )
+
+        self.use_guidance = bool(
+            use_guidance
+        )
+
+        self.guidance = GuidanceGenerator(
+            rgb_channels=rgb_channels,
+            tir_channels=tir_channels,
+            guide_channels=guide_channels,
+        )
+
+        # Avg + Max -> scale-specific RGB channels
+        self.detail_projection = nn.Sequential(
+            nn.Conv2d(
+                detail_channels * 2,
+                rgb_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=False,
+            ),
+
+            nn.BatchNorm2d(
+                rgb_channels
+            ),
+
+            nn.SiLU(
+                inplace=True
+            ),
+        )
+
+        # Independent learnable soft-enhancement strength.
+        # sigmoid(0) = 0.5
+        self.alpha_logit = nn.Parameter(
+            torch.tensor(
+                0.0,
+                dtype=torch.float32,
+            )
+        )
+
+        # Independent residual injection strength.
+        # tanh(0) = 0 -> exact baseline at initialization.
+        self.gamma_raw = nn.Parameter(
+            torch.tensor(
+                0.0,
+                dtype=torch.float32,
+            )
+        )
+
+    @staticmethod
+    def _resize(
+        x: torch.Tensor,
+        size: Tuple[int, int],
+    ) -> torch.Tensor:
+
+        if (
+            x.shape[-2:]
+            == size
+        ):
+            return x
+
+        return F.interpolate(
+            x,
+            size=size,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    def _compress_detail(
+        self,
+        detail: torch.Tensor,
+        rgb_feat: torch.Tensor,
+    ) -> torch.Tensor:
+
+        target_size = tuple(
+            rgb_feat.shape[-2:]
+        )
+
+        avg_detail = (
+            F.adaptive_avg_pool2d(
+                detail,
+                output_size=target_size,
+            )
+        )
+
+        max_detail = (
+            F.adaptive_max_pool2d(
+                detail,
+                output_size=target_size,
+            )
+        )
+
+        merged = torch.cat(
+            [
+                avg_detail,
+                max_detail,
+            ],
+            dim=1,
+        )
+
+        return self.detail_projection(
+            merged
+        )
+
+    def forward(
+        self,
+        detail_raw: torch.Tensor,
+        rgb_feat: torch.Tensor,
+        tir_feat: torch.Tensor,
+        return_debug: bool = False,
+    ):
+
+        if (
+            rgb_feat.shape[1]
+            != self.rgb_channels
+        ):
+            raise ValueError(
+                "RGB feature channels mismatch: "
+                f"{rgb_feat.shape[1]} != "
+                f"{self.rgb_channels}"
+            )
+
+        if (
+            tir_feat.shape[1]
+            != self.tir_channels
+        ):
+            raise ValueError(
+                "TIR feature channels mismatch: "
+                f"{tir_feat.shape[1]} != "
+                f"{self.tir_channels}"
+            )
+
+        # -------------------------------------------------------
+        # 1. Scale-specific semantic guidance
+        # -------------------------------------------------------
+
+        if self.use_guidance:
+
+            guidance = self.guidance(
+                rgb_feat,
+                tir_feat,
+            )
+
+            guidance_high = self._resize(
+                guidance,
+                size=tuple(
+                    detail_raw.shape[-2:]
+                ),
+            )
+
+        else:
+
+            guidance = torch.zeros(
+                (
+                    rgb_feat.shape[0],
+                    1,
+                    rgb_feat.shape[-2],
+                    rgb_feat.shape[-1],
+                ),
+                device=rgb_feat.device,
+                dtype=rgb_feat.dtype,
+            )
+
+            guidance_high = torch.zeros(
+                (
+                    detail_raw.shape[0],
+                    1,
+                    detail_raw.shape[-2],
+                    detail_raw.shape[-1],
+                ),
+                device=detail_raw.device,
+                dtype=detail_raw.dtype,
+            )
+
+        # -------------------------------------------------------
+        # 2. Soft enhancement
+        # -------------------------------------------------------
+
+        alpha = torch.sigmoid(
+            self.alpha_logit
+        )
+
+        guided_detail = (
+            detail_raw
+            * (
+                1.0
+                + alpha
+                * guidance_high
+            )
+        )
+
+        # -------------------------------------------------------
+        # 3. Compress shared detail to current P_s resolution
+        # -------------------------------------------------------
+
+        detail_scale = self._compress_detail(
+            guided_detail,
+            rgb_feat,
+        )
+
+        # -------------------------------------------------------
+        # 4. Residual injection
+        # -------------------------------------------------------
+
+        gamma = torch.tanh(
+            self.gamma_raw
+        )
+
+        enhanced_rgb = (
+            rgb_feat
+            + gamma
+            * detail_scale
+        )
+
+        if not return_debug:
+            return enhanced_rgb
+
+        return (
+            enhanced_rgb,
+            {
+                "guidance":
+                    guidance,
+
+                "guidance_high":
+                    guidance_high,
+
+                "guided_detail":
+                    guided_detail,
+
+                "detail_scale":
+                    detail_scale,
+
+                "alpha":
+                    alpha,
+
+                "gamma":
+                    gamma,
+
+                "enhanced_rgb":
+                    enhanced_rgb,
+            },
+        )
+
+    @torch.no_grad()
+    def scalar_state(
+        self,
+    ) -> Dict[str, float]:
+
+        return {
+            "alpha":
+                float(
+                    torch.sigmoid(
+                        self.alpha_logit
+                    ).cpu().item()
+                ),
+
+            "gamma":
+                float(
+                    torch.tanh(
+                        self.gamma_raw
+                    ).cpu().item()
+                ),
+        }
+
+
+# ===========================================================================
+# Multi-scale RSD-T
+# ===========================================================================
+
+class MultiScaleRSDTv1(nn.Module):
+    """
+    Configurable multi-scale RSD-T.
+
+    Parameters
+    ----------
+    rgb_channels:
+        {3: C3, 4: C4, 5: C5}
+
+    tir_channels:
+        {3: C3_t, 4: C4_t, 5: C5_t}
+
+    scales:
+        Any non-empty subset of {3, 4, 5}.
+
+    Example:
+        scales=(3,)
+        scales=(4,)
+        scales=(3, 4)
+        scales=(3, 4, 5)
+    """
+
+    VALID_SCALES = (
+        3,
+        4,
+        5,
+    )
+
+    def __init__(
+        self,
+        rgb_channels: Mapping[int, int],
+        tir_channels: Mapping[int, int],
+        scales: Iterable[int] = (3,),
         detail_channels: int = 64,
         stem_channels: int = 24,
         guide_channels: int = 32,
@@ -259,12 +627,38 @@ class RSDTv1(nn.Module):
     ):
         super().__init__()
 
-        self.rgb_p3_channels = int(
-            rgb_p3_channels
+        scales = tuple(
+            sorted(
+                {
+                    int(s)
+                    for s in scales
+                }
+            )
         )
 
-        self.tir_p3_channels = int(
-            tir_p3_channels
+        if not scales:
+            raise ValueError(
+                "rsdt_scales 不能为空。"
+            )
+
+        invalid = [
+            s
+            for s in scales
+            if s not in self.VALID_SCALES
+        ]
+
+        if invalid:
+            raise ValueError(
+                "rsdt_scales 仅支持 "
+                "[3], [4], [5], [3,4], "
+                "[3,5], [4,5], [3,4,5]。"
+                f" 当前非法值: {invalid}"
+            )
+
+        self.scales = scales
+
+        self.detail_channels = int(
+            detail_channels
         )
 
         self.use_guidance = bool(
@@ -275,48 +669,59 @@ class RSDTv1(nn.Module):
             exact_identity_when_equal
         )
 
+        # -------------------------------------------------------
+        # Shared detail branch: compute exactly once.
+        # -------------------------------------------------------
+
         self.detail_stem = DetailStem(
             detail_channels=detail_channels,
             stem_channels=stem_channels,
         )
 
-        self.guidance = GuidanceGenerator(
-            rgb_channels=rgb_p3_channels,
-            tir_channels=tir_p3_channels,
-            guide_channels=guide_channels,
-        )
+        # -------------------------------------------------------
+        # Independent adapter for every selected pyramid level.
+        # -------------------------------------------------------
 
-        self.detail_to_p3 = nn.Sequential(
-            nn.Conv2d(
-                detail_channels * 2,
-                rgb_p3_channels,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-                bias=False,
-            ),
-            nn.BatchNorm2d(
-                rgb_p3_channels
-            ),
-            nn.SiLU(
-                inplace=True
-            ),
-        )
+        adapters = {}
 
-        # alpha in (0,1), alpha_init = 0.5
-        self.alpha_logit = nn.Parameter(
-            torch.tensor(
-                0.0,
-                dtype=torch.float32,
+        for scale in self.scales:
+
+            if scale not in rgb_channels:
+                raise KeyError(
+                    f"Missing RGB channels for P{scale}."
+                )
+
+            if scale not in tir_channels:
+                raise KeyError(
+                    f"Missing TIR channels for P{scale}."
+                )
+
+            adapters[
+                str(scale)
+            ] = RSDTScaleAdapter(
+                rgb_channels=int(
+                    rgb_channels[scale]
+                ),
+
+                tir_channels=int(
+                    tir_channels[scale]
+                ),
+
+                detail_channels=(
+                    detail_channels
+                ),
+
+                guide_channels=(
+                    guide_channels
+                ),
+
+                use_guidance=(
+                    use_guidance
+                ),
             )
-        )
 
-        # gamma in (-1,1), gamma_init = 0
-        self.gamma_raw = nn.Parameter(
-            torch.tensor(
-                0.0,
-                dtype=torch.float32,
-            )
+        self.adapters = nn.ModuleDict(
+            adapters
         )
 
     @staticmethod
@@ -361,97 +766,65 @@ class RSDTv1(nn.Module):
             reconstructed_high,
         )
 
-    def compress_detail_to_p3(
-        self,
-        detail: torch.Tensor,
-        rgb_p3: torch.Tensor,
-    ) -> torch.Tensor:
-
-        target_size = tuple(
-            rgb_p3.shape[-2:]
-        )
-
-        avg_detail = (
-            F.adaptive_avg_pool2d(
-                detail,
-                output_size=target_size,
-            )
-        )
-
-        max_detail = (
-            F.adaptive_max_pool2d(
-                detail,
-                output_size=target_size,
-            )
-        )
-
-        detail = torch.cat(
-            [
-                avg_detail,
-                max_detail,
-            ],
-            dim=1,
-        )
-
-        return self.detail_to_p3(
-            detail
-        )
-
     def forward(
         self,
         rgb_high: torch.Tensor,
         rgb_semantic: torch.Tensor,
-        rgb_p3: torch.Tensor,
-        tir_p3: torch.Tensor,
+        rgb_features: Mapping[
+            int,
+            torch.Tensor,
+        ],
+        tir_features: Mapping[
+            int,
+            torch.Tensor,
+        ],
         return_debug: bool = False,
     ):
+        """
+        Returns
+        -------
+        enhanced_features:
+            dict:
+                {
+                    3: enhanced P3,
+                    4: enhanced P4,
+                    5: enhanced P5
+                }
+            only selected scales are returned.
 
-        if (
-            rgb_high.ndim != 4
-            or rgb_semantic.ndim != 4
-            or rgb_p3.ndim != 4
-            or tir_p3.ndim != 4
-        ):
-            raise ValueError(
-                "RSD-T 所有输入必须为 BCHW Tensor。"
-            )
-
-        if (
-            rgb_p3.shape[1]
-            != self.rgb_p3_channels
-        ):
-            raise ValueError(
-                "RGB P3 channel mismatch: "
-                f"{rgb_p3.shape[1]} != "
-                f"{self.rgb_p3_channels}"
-            )
-
-        if (
-            tir_p3.shape[1]
-            != self.tir_p3_channels
-        ):
-            raise ValueError(
-                "TIR P3 channel mismatch: "
-                f"{tir_p3.shape[1]} != "
-                f"{self.tir_p3_channels}"
-            )
+        debug:
+            optional per-scale diagnostics.
+        """
 
         equal_resolution = (
             rgb_high.shape[-2:]
             == rgb_semantic.shape[-2:]
         )
 
-        # 640+640: exact baseline behavior.
+        # -------------------------------------------------------
+        # Equal resolution:
+        # exact identity, no detail branch computation.
+        # -------------------------------------------------------
+
         if (
             equal_resolution
             and self.exact_identity_when_equal
         ):
 
+            outputs = {
+                scale:
+                    rgb_features[
+                        scale
+                    ]
+
+                for scale in self.scales
+            }
+
             if not return_debug:
-                return rgb_p3
+                return outputs
 
             return (
-                rgb_p3,
+                outputs,
                 {
                     "equal_resolution":
                         True,
@@ -467,36 +840,15 @@ class RSDTv1(nn.Module):
                     "detail_raw":
                         None,
 
-                    "guidance":
-                        None,
-
-                    "guidance_high":
-                        None,
-
-                    "guided_detail":
-                        None,
-
-                    "detail_p3":
-                        torch.zeros_like(
-                            rgb_p3
-                        ),
-
-                    "alpha":
-                        torch.sigmoid(
-                            self.alpha_logit
-                        ),
-
-                    "gamma":
-                        torch.tanh(
-                            self.gamma_raw
-                        ),
-
-                    "enhanced_rgb_p3":
-                        rgb_p3,
+                    "scales":
+                        {},
                 },
             )
 
-        # 1. Resolution residual
+        # -------------------------------------------------------
+        # 1. Shared resolution residual
+        # -------------------------------------------------------
+
         (
             residual,
             reconstructed_high,
@@ -505,143 +857,172 @@ class RSDTv1(nn.Module):
             rgb_semantic,
         )
 
-        # 2. High-resolution shallow detail
+        # -------------------------------------------------------
+        # 2. Shared DetailStem: ONE computation only
+        # -------------------------------------------------------
+
         detail_raw = self.detail_stem(
             residual
         )
 
-        # 3. RGB-T semantic guidance
-        if self.use_guidance:
+        enhanced_features = {}
+        scale_debug = {}
 
-            guidance = self.guidance(
-                rgb_p3,
-                tir_p3,
-            )
+        # -------------------------------------------------------
+        # 3. Independent scale adapters
+        # -------------------------------------------------------
 
-            guidance_high = self._resize(
-                guidance,
-                size=tuple(
-                    detail_raw.shape[-2:]
-                ),
-            )
+        for scale in self.scales:
 
-        else:
+            adapter = self.adapters[
+                str(scale)
+            ]
 
-            guidance = torch.zeros(
+            if return_debug:
+
                 (
-                    rgb_p3.shape[0],
-                    1,
-                    rgb_p3.shape[-2],
-                    rgb_p3.shape[-1],
-                ),
-                device=rgb_p3.device,
-                dtype=rgb_p3.dtype,
-            )
+                    enhanced,
+                    debug,
+                ) = adapter(
+                    detail_raw=detail_raw,
 
-            guidance_high = torch.zeros(
-                (
-                    detail_raw.shape[0],
-                    1,
-                    detail_raw.shape[-2],
-                    detail_raw.shape[-1],
-                ),
-                device=detail_raw.device,
-                dtype=detail_raw.dtype,
-            )
+                    rgb_feat=(
+                        rgb_features[
+                            scale
+                        ]
+                    ),
 
-        # 4. Soft enhancement
-        alpha = torch.sigmoid(
-            self.alpha_logit
-        )
+                    tir_feat=(
+                        tir_features[
+                            scale
+                        ]
+                    ),
 
-        guided_detail = (
-            detail_raw
-            * (
-                1.0
-                + alpha
-                * guidance_high
-            )
-        )
+                    return_debug=True,
+                )
 
-        # 5. Detail -> P3
-        detail_p3 = (
-            self.compress_detail_to_p3(
-                guided_detail,
-                rgb_p3,
-            )
-        )
+                scale_debug[
+                    scale
+                ] = debug
 
-        # 6. Residual P3 injection
-        gamma = torch.tanh(
-            self.gamma_raw
-        )
+            else:
 
-        enhanced_rgb_p3 = (
-            rgb_p3
-            + gamma
-            * detail_p3
-        )
+                enhanced = adapter(
+                    detail_raw=detail_raw,
+
+                    rgb_feat=(
+                        rgb_features[
+                            scale
+                        ]
+                    ),
+
+                    tir_feat=(
+                        tir_features[
+                            scale
+                        ]
+                    ),
+
+                    return_debug=False,
+                )
+
+            enhanced_features[
+                scale
+            ] = enhanced
 
         if not return_debug:
-            return enhanced_rgb_p3
-
-        debug: Dict[str, object] = {
-            "equal_resolution":
-                False,
-
-            "resolution_residual":
-                residual,
-
-            "reconstructed_high":
-                reconstructed_high,
-
-            "detail_raw":
-                detail_raw,
-
-            "guidance":
-                guidance,
-
-            "guidance_high":
-                guidance_high,
-
-            "guided_detail":
-                guided_detail,
-
-            "detail_p3":
-                detail_p3,
-
-            "alpha":
-                alpha,
-
-            "gamma":
-                gamma,
-
-            "enhanced_rgb_p3":
-                enhanced_rgb_p3,
-        }
+            return enhanced_features
 
         return (
-            enhanced_rgb_p3,
-            debug,
+            enhanced_features,
+            {
+                "equal_resolution":
+                    False,
+
+                "resolution_residual":
+                    residual,
+
+                "reconstructed_high":
+                    reconstructed_high,
+
+                "detail_raw":
+                    detail_raw,
+
+                "scales":
+                    scale_debug,
+            },
         )
 
     @torch.no_grad()
     def scalar_state(
         self,
     ) -> Dict[str, float]:
+        """
+        Backward-compatible keys:
+            alpha
+            gamma
 
-        return {
-            "alpha":
-                float(
-                    torch.sigmoid(
-                        self.alpha_logit
-                    ).cpu().item()
-                ),
+        For multi-scale use, these are the arithmetic means.
 
-            "gamma":
-                float(
-                    torch.tanh(
-                        self.gamma_raw
-                    ).cpu().item()
-                ),
-        }
+        Scale-specific keys:
+            alpha_p3
+            gamma_p3
+            alpha_p4
+            gamma_p4
+            ...
+        """
+
+        result = {}
+
+        alphas = []
+        gammas = []
+
+        for scale in self.scales:
+
+            state = self.adapters[
+                str(scale)
+            ].scalar_state()
+
+            alpha = state[
+                "alpha"
+            ]
+
+            gamma = state[
+                "gamma"
+            ]
+
+            result[
+                f"alpha_p{scale}"
+            ] = alpha
+
+            result[
+                f"gamma_p{scale}"
+            ] = gamma
+
+            alphas.append(
+                alpha
+            )
+
+            gammas.append(
+                gamma
+            )
+
+        result[
+            "alpha"
+        ] = (
+            sum(alphas)
+            / len(alphas)
+        )
+
+        result[
+            "gamma"
+        ] = (
+            sum(gammas)
+            / len(gammas)
+        )
+
+        return result
+
+
+# Backward-compatible alias.
+# New code should prefer MultiScaleRSDTv1.
+RSDTv1 = MultiScaleRSDTv1

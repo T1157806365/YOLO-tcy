@@ -66,7 +66,192 @@ from train_rsdt import (
 
 
 # ===========================================================================
-# 1. Load RSD-T checkpoint
+# 1. Legacy checkpoint compatibility
+# ===========================================================================
+
+def convert_legacy_rsdt_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """
+    Convert the original P3-only RSD-T checkpoint layout to the new
+    configurable multi-scale RSD-T layout.
+
+    Old P3-only keys
+    ----------------
+    rsdt.alpha_logit
+    rsdt.gamma_raw
+    rsdt.guidance.*
+    rsdt.detail_to_p3.*
+
+    New P3 keys
+    -----------
+    rsdt.adapters.3.alpha_logit
+    rsdt.adapters.3.gamma_raw
+    rsdt.adapters.3.guidance.*
+    rsdt.adapters.3.detail_projection.*
+
+    Shared keys such as:
+        rsdt.detail_stem.*
+    are kept unchanged.
+
+    Notes
+    -----
+    - New-format checkpoints are returned unchanged.
+    - This conversion is valid for legacy P3-only RSD-T weights.
+    - strict=True is still used after conversion, so parameter mismatches
+      will not be silently ignored.
+    """
+
+    # -------------------------------------------------------
+    # Handle DataParallel / DDP-style "module." prefix if any.
+    # -------------------------------------------------------
+    if (
+        state_dict
+        and all(
+            key.startswith("module.")
+            for key in state_dict.keys()
+        )
+    ):
+        state_dict = {
+            key[len("module."):]:
+                value
+            for key, value
+            in state_dict.items()
+        }
+
+    # -------------------------------------------------------
+    # Already new multi-scale format -> return unchanged.
+    # -------------------------------------------------------
+    if any(
+        key.startswith(
+            "rsdt.adapters."
+        )
+        for key in state_dict.keys()
+    ):
+        return state_dict
+
+    # -------------------------------------------------------
+    # Not an old RSD-T state dict -> return unchanged and let
+    # strict=True report the actual incompatibility.
+    # -------------------------------------------------------
+    legacy_detected = any(
+        (
+            key == "rsdt.alpha_logit"
+            or key == "rsdt.gamma_raw"
+            or key.startswith(
+                "rsdt.guidance."
+            )
+            or key.startswith(
+                "rsdt.detail_to_p3."
+            )
+        )
+        for key in state_dict.keys()
+    )
+
+    if not legacy_detected:
+        return state_dict
+
+    print(
+        "\n"
+        "============================================================"
+    )
+    print(
+        "Detected legacy P3-only RSD-T checkpoint"
+    )
+    print(
+        "Converting old RSD-T parameter names -> "
+        "new multi-scale P3 layout"
+    )
+    print(
+        "============================================================"
+    )
+
+    converted = {}
+
+    converted_count = 0
+
+    for key, value in state_dict.items():
+        new_key = key
+
+        # ---------------------------------------------------
+        # Learnable scalar parameters
+        # ---------------------------------------------------
+        if key == "rsdt.alpha_logit":
+            new_key = (
+                "rsdt.adapters.3.alpha_logit"
+            )
+
+        elif key == "rsdt.gamma_raw":
+            new_key = (
+                "rsdt.adapters.3.gamma_raw"
+            )
+
+        # ---------------------------------------------------
+        # P3 Guidance Generator
+        # ---------------------------------------------------
+        elif key.startswith(
+            "rsdt.guidance."
+        ):
+            suffix = key[
+                len(
+                    "rsdt.guidance."
+                ):
+            ]
+
+            new_key = (
+                "rsdt.adapters.3.guidance."
+                + suffix
+            )
+
+        # ---------------------------------------------------
+        # Old P3 detail projection
+        # ---------------------------------------------------
+        elif key.startswith(
+            "rsdt.detail_to_p3."
+        ):
+            suffix = key[
+                len(
+                    "rsdt.detail_to_p3."
+                ):
+            ]
+
+            new_key = (
+                "rsdt.adapters.3."
+                "detail_projection."
+                + suffix
+            )
+
+        # ---------------------------------------------------
+        # Shared DetailStem and all non-RSD-T parameters stay
+        # exactly unchanged.
+        # ---------------------------------------------------
+
+        if new_key != key:
+            converted_count += 1
+
+        converted[
+            new_key
+        ] = value
+
+    print(
+        f"Converted parameter entries : "
+        f"{converted_count}"
+    )
+    print(
+        "Legacy checkpoint target    : P3"
+    )
+    print(
+        "Loading policy              : strict=True"
+    )
+    print(
+        "============================================================\n"
+    )
+
+    return converted
+
+
+# ===========================================================================
+# 2. Load RSD-T checkpoint
 # ===========================================================================
 
 def load_rsdt_checkpoint(
@@ -168,6 +353,11 @@ def load_rsdt_checkpoint(
             )
         ),
 
+        rsdt_scales=model_cfg.get(
+            "rsdt_scales",
+            [3],
+        ),
+
         use_guidance=bool(
             model_cfg.get(
                 "use_guidance",
@@ -199,10 +389,23 @@ def load_rsdt_checkpoint(
         verbose=False,
     )
 
+    state_dict = ckpt[
+        "model_state_dict"
+    ]
+
+    # -------------------------------------------------------
+    # Backward compatibility:
+    # old P3-only RSD-T -> new configurable P3 adapter.
+    # New checkpoints are returned unchanged.
+    # -------------------------------------------------------
+    state_dict = (
+        convert_legacy_rsdt_state_dict(
+            state_dict
+        )
+    )
+
     model.load_state_dict(
-        ckpt[
-            "model_state_dict"
-        ],
+        state_dict,
         strict=True,
     )
 
@@ -220,7 +423,7 @@ def load_rsdt_checkpoint(
 
 
 # ===========================================================================
-# 2. Params / FLOPs
+# 3. Params / FLOPs
 # ===========================================================================
 
 def get_params_m(
@@ -363,7 +566,7 @@ def get_model_complexity_rsdt(
 
 
 # ===========================================================================
-# 3. Standardized batch=1 FPS
+# 4. Standardized batch=1 FPS
 # ===========================================================================
 
 @torch.inference_mode()
@@ -500,7 +703,7 @@ def benchmark_fps_rsdt(
 
 
 # ===========================================================================
-# 4. Paper CSV
+# 5. Paper CSV
 # ===========================================================================
 
 def save_metrics_csv_rsdt(
@@ -552,7 +755,7 @@ def save_metrics_csv_rsdt(
 
 
 # ===========================================================================
-# 5. Main full validation
+# 6. Main full validation
 # ===========================================================================
 
 @torch.inference_mode()
@@ -811,6 +1014,9 @@ def validate(
     )
     print(
         f"TIR imgsz      : {tir_imgsz}"
+    )
+    print(
+        f"RSD-T scales   : {list(model.rsdt_scales)}"
     )
     print(
         f"Batch          : {batch_size}"
@@ -1592,6 +1798,11 @@ def validate(
         ),
 
         "rsdt": {
+            "scales": [
+                int(s)
+                for s in model.rsdt_scales
+            ],
+
             "use_guidance": bool(
                 getattr(
                     model,
@@ -1599,12 +1810,11 @@ def validate(
                     True,
                 )
             ),
-            "alpha": rsdt_state.get(
-                "alpha"
-            ),
-            "gamma": rsdt_state.get(
-                "gamma"
-            ),
+
+            "scalar_state": {
+                str(k): float(v)
+                for k, v in rsdt_state.items()
+            },
         },
 
         "complexity": {

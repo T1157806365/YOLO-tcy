@@ -567,6 +567,11 @@ def build_rsdt_model_adapter(
             )
         ),
 
+        rsdt_scales=model_cfg.get(
+            "rsdt_scales",
+            [3],
+        ),
+
         use_guidance=bool(
             model_cfg.get(
                 "use_guidance",
@@ -806,6 +811,10 @@ def train(
     print(
         f"RGB semantic    : "
         f"{cfg['data']['rgb_semantic_imgsz']}"
+    )
+    print(
+        f"RSD-T scales    : "
+        f"{cfg.get('model', {}).get('rsdt_scales', [3])}"
     )
     print(
         f"TIR             : "
