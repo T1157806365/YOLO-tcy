@@ -28,7 +28,7 @@ from models.rgbt_model import (
     RGBTDetectionModel,
 )
 
-from models.rsd_t_v1 import (
+from models.modules.rsd_t_v1 import (
     RSDTv1,
 )
 

@@ -87,9 +87,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 from utils.config import resolve_model
-from models.modules.hra_fusion import (
-    HRAFusion,
-)
 
 # ============================================================
 # 1. Basic Conv block
