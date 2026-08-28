@@ -9,15 +9,15 @@ traincc:
   mkdir -p logs
   nohup python -u train_rsdt.py \
     --cfg configs/experiments/uavcb_rsdt_yolo26n_1280_640.yaml \
-    > logs/uavcb_rsdt_yolo26n_1280_640_P345.log 2>&1 &
+    > logs/uavcb_rsdt_yolo26n_1280_640_P34.log 2>&1 &
 
-  echo $! > pid/uavcb_rsdt_yolo26n_1280_640_P345.pid
-  tail -f logs/uavcb_rsdt_yolo26n_1280_640_P345.log
+  echo $! > pid/uavcb_rsdt_yolo26n_1280_640_P34.pid
+  tail -f logs/uavcb_rsdt_yolo26n_1280_640_P34.log
 
   conda activate tcy
   cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
   python val_rsdt.py \
-    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rsdt/yolo26n_UAVCB_rsdt_P345_rgb1280_sem640_tir640_seed0/weights/best.pt \
+    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rsdt/yolo26n_UAVCB_rsdt_P34_rgb1280_sem640_tir640_seed0/weights/best.pt \
     --split test \
     --rgb /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml \
     --tir /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml \
@@ -25,7 +25,7 @@ traincc:
     --rgb-semantic-imgsz 640 \
     --tir-imgsz 640 \
     --batch 8 \
-    --device 4 \
+    --device 5 \
     --plots \
     --preview-num 6 \
     --preview-conf 0.25 \
@@ -38,7 +38,7 @@ model:
   fusion: concat
   align_mode: bilinear
   # [3, 4, 5] -> P3 + P4 + P5
-  rsdt_scales: [3, 4, 5]
+  rsdt_scales: [3, 4]
   use_guidance: true
   detail_channels: 64
   stem_channels: 24
@@ -121,4 +121,4 @@ output:
   project: runs/rsdt
   # Keep your current experiment naming convention.
   # Change this for P4/P5/multiscale ablations to avoid mixing results.
-  name: yolo26n_UAVCB_rsdt_P345_rgb1280_sem640_tir640_seed0
+  name: yolo26n_UAVCB_rsdt_P34_rgb1280_sem640_tir640_seed0
