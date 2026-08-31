@@ -37,7 +37,7 @@ Current task:
     --rgb-imgsz 1280 \
     --tir-imgsz 640 \
     --batch 4 \
-    --device 3
+    --device 5
 """
 
 from __future__ import annotations

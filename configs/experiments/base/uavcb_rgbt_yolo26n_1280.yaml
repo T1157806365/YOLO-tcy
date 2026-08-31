@@ -31,7 +31,7 @@ train:
   epochs: 300
   batch: 24
   workers: 4
-  device: 4
+  device: 3
   optimizer: SGD
   lr0: 0.01
   lrf: 0.01

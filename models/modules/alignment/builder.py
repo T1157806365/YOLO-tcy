@@ -29,11 +29,13 @@ from typing import Any, Dict, Type
 
 from .base import BaseAlignment
 from .identity import IdentityAlignment
-
+from .fbam import FBAMAlignment
 
 BUILTIN_ALIGNMENTS = {
     "identity":
         IdentityAlignment,
+    "fbam":
+        FBAMAlignment,
 }
 
 

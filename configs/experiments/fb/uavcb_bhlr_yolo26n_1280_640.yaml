@@ -1,0 +1,340 @@
+# ============================================================
+
+traincc:
+  conda activate tcy
+  cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
+  mkdir -p logs
+  mkdir -p pid
+
+  nohup python -u train_fbam_bhlr.py \
+    --cfg configs/experiments/fb/uavcb_bhlr_yolo26n_1280_640.yaml \
+    > logs/uavcb_bhlrP3_yolo26n_1280_640.log 2>&1 &
+  echo $! > pid/uavcb_bhlrP3_yolo26n_1280_640.pid
+  tail -f logs/uavcb_bhlrP3_yolo26n_1280_640.log
+
+
+  conda activate tcy
+  cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
+  python val_fbam_bhlr.py \
+    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/fbam_bhlr/yolo26n_UAVCB_bhlrP3_rgb1280_sem640_tir640_seed0/weights/best.pt \
+    --split test \
+    --rgb /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml \
+    --tir /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml \
+    --rgb-imgsz 1280 \
+    --rgb-semantic-imgsz 640 \
+    --tir-imgsz 640 \
+    --batch 4 \
+    --device 5 \
+    --plots \
+    --preview-num 6 \
+    --preview-conf 0.25 \
+    --preview-cols 3
+model:
+  # ----------------------------------------------------------
+  # YOLO backbone
+  # ----------------------------------------------------------
+  name: yolo26n
+  pretrained: true
+  fusion: concat
+  align_mode: bilinear
+
+  bhlr_scales: [3]
+  high_to_semantic_ratio: 2
+  detail_channels: 64
+  stem_channels: 32
+  guide_channels: 32
+  # ----------------------------------------------------------
+  # Frequency-aware boundary parameters inside BHLR
+  # ----------------------------------------------------------
+
+  bhlr_freq_cutoff: 0.15
+  bhlr_freq_sharpness: 24.0
+
+  alignment:
+    # Enable real alignment
+    enabled: false
+    # Use the new FBAM plugin
+    type: identity
+    scales: [3]
+     # 明确不把任何 alignment 输出送给 BHLR
+    use_for_bhlr: false
+    # 最终融合也直接使用 raw TIR
+    use_for_fusion: false
+
+    hidden_channels: 32
+
+
+    # --------------------------------------------------------
+    # Coarse alignment
+    #
+    # Maximum offset measured in feature-map pixels.
+    #
+    # For P3:
+    #   stride = 8
+    #
+    # max_coarse_offset = 4
+    #
+    # means approximately:
+    #
+    #   ±4 feature pixels
+    #   ≈ ±32 input pixels
+    # --------------------------------------------------------
+
+    max_coarse_offset: 4.0
+
+
+    # --------------------------------------------------------
+    # Fine boundary alignment
+    # --------------------------------------------------------
+
+    max_fine_offset: 2.0
+
+
+    # --------------------------------------------------------
+    # Frequency-aware boundary extraction
+    # --------------------------------------------------------
+
+    freq_cutoff: 0.15
+
+    freq_sharpness: 24.0
+
+
+    # --------------------------------------------------------
+    # Alignment confidence
+    #
+    # true:
+    # unreliable boundary correspondence suppresses
+    # fine alignment offset.
+    # --------------------------------------------------------
+
+    use_confidence: true
+
+
+    # --------------------------------------------------------
+    # Route aligned TIR to BHLR
+    #
+    # true:
+    #
+    # RGB + aligned TIR
+    #       ↓
+    # BHLR support-region generation
+    #
+    # false:
+    #
+    # RGB + raw TIR
+    #       ↓
+    # BHLR
+    # --------------------------------------------------------
+
+    use_for_bhlr: true
+
+
+    # --------------------------------------------------------
+    # Route aligned TIR to final concat fusion
+    #
+    # true:
+    #
+    # enhanced RGB
+    #       +
+    # aligned TIR
+    #       ↓
+    # concat
+    #
+    # Recommended: true
+    # --------------------------------------------------------
+
+    use_for_fusion: true
+
+
+# ============================================================
+# Data
+# ============================================================
+
+data:
+
+  rgb: /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml
+
+  tir: /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml
+
+
+  # ----------------------------------------------------------
+  # Same original RGB image produces TWO RGB views
+  #
+  # Original UAV-CB RGB
+  #        │
+  #        ├───────────────┐
+  #        ↓               ↓
+  # High RGB            Semantic RGB
+  # 1280 canvas         640 canvas
+  #
+  # The high RGB is used ONLY by BHLR.
+  #
+  # The semantic RGB goes through RGB Backbone.
+  # ----------------------------------------------------------
+
+  rgb_imgsz: 1280
+
+  rgb_semantic_imgsz: 640
+
+
+  # ----------------------------------------------------------
+  # TIR backbone input
+  # ----------------------------------------------------------
+
+  tir_imgsz: 640
+
+
+  # ----------------------------------------------------------
+  # RGB/TIR pairing
+  # ----------------------------------------------------------
+
+  pair_mode: relative
+
+
+# ============================================================
+# Training
+# ============================================================
+
+train:
+
+  # ----------------------------------------------------------
+  # Stage 1
+  #
+  # First change this to 1 for smoke test.
+  #
+  # After successful:
+  #   forward
+  #   backward
+  #   loss
+  #   validation
+  #   checkpoint
+  #
+  # change to 300.
+  # ----------------------------------------------------------
+
+  epochs: 300
+
+
+  # High RGB 1280 consumes additional memory in BHLR.
+  #
+  # First smoke test can use 8.
+  # After checking GPU memory, increase to 16 / 24.
+  batch: 8
+
+
+  workers: 4
+
+  device: 5
+
+
+  # ----------------------------------------------------------
+  # Optimizer
+  # ----------------------------------------------------------
+
+  optimizer: SGD
+
+  lr0: 0.01
+
+  lrf: 0.01
+
+  momentum: 0.937
+
+  weight_decay: 0.0005
+
+
+  # ----------------------------------------------------------
+  # Training settings
+  # ----------------------------------------------------------
+
+  amp: true
+
+  seed: 0
+
+  deterministic: true
+
+  grad_clip: 10.0
+
+
+  # ----------------------------------------------------------
+  # Early stopping
+  # ----------------------------------------------------------
+
+  patience: 50
+
+  early_stop_min_delta: 0.000001
+
+
+  # ----------------------------------------------------------
+  # Resume
+  # ----------------------------------------------------------
+
+  resume: null
+
+
+  # ==========================================================
+  # Stage 2
+  #
+  # For the FIRST smoke test:
+  # keep disabled.
+  #
+  # After Stage 1 works, restore:
+  #
+  # enabled: true
+  # epochs: 200
+  # ==========================================================
+
+  stage2:
+
+    enabled: true
+
+    epochs: 200
+
+    lr0: 0.001
+
+    lrf: 0.01
+
+    patience: 50
+
+    early_stop_min_delta: 0.000001
+
+
+# ============================================================
+# Augmentation
+# ============================================================
+
+augment:
+
+  # rsdt_dataset.py already guarantees the SAME random flip
+  # for:
+  #
+  # RGB-high
+  # RGB-semantic
+  # TIR
+  #
+  # Therefore this augmentation can be retained.
+
+  fliplr: 0.5
+
+  flipud: 0.0
+
+
+# ============================================================
+# Loss
+# ============================================================
+
+loss:
+
+  box: 7.5
+
+  cls: 0.5
+
+  dfl: 1.5
+
+
+# ============================================================
+# Output
+# ============================================================
+
+output:
+  project: runs/fbam_bhlr
+  name: yolo26n_UAVCB_bhlrP3_rgb1280_sem640_tir640_seed0
