@@ -39,11 +39,11 @@ Notes
 conda activate tcy
 cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
 python visualize_fbam_bhlr_internal.py \
-  --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/fbam_bhlr/yolo26n_UAVCB_fbamP3_bhlrP3_rgb1920_sem640_tir640_seed0/weights/best.pt \
+  --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/fbam_bhlr/yolo26n_UAVCB_fbamP3_bhlrP3_rgb1280_sem640_tir640_seed0_V2/weights/best.pt \
   --split test \
   --device 5 \
   --seed 0 \
-  --index 0
+  --index 0 100 200 300 400 500 600
 """
 
 from __future__ import annotations
@@ -2353,10 +2353,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--index",
         type=int,
+        nargs="+",
         default=None,
         help=(
-            "Dataset index. If omitted, randomly choose "
-            "one UAV-positive sample."
+            "One or more dataset indices. Examples: "
+            "--index 0 50 100 200. "
+            "If omitted, randomly choose one UAV-positive sample."
         ),
     )
 
@@ -2412,23 +2414,108 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    visualize(
-        weights=args.weights,
-        split=args.split,
-        device_str=args.device,
-        rgb_yaml=args.rgb,
-        tir_yaml=args.tir,
-        rgb_imgsz=args.rgb_imgsz,
-        rgb_semantic_imgsz=args.rgb_semantic_imgsz,
-        tir_imgsz=args.tir_imgsz,
-        pair_mode=args.pair_mode,
-        index=args.index,
-        seed=args.seed,
-        align_scale=args.align_scale,
-        bhlr_scale=args.bhlr_scale,
-        conf=args.conf,
-        iou=args.iou,
-        max_det=args.max_det,
-        support_thr=args.support_thr,
-        save_dir=args.save_dir,
+    # ---------------------------------------------------------------
+    # Multi-index mode
+    #
+    # Example:
+    #   --index 10 20 30
+    #
+    # If --index is omitted, preserve the old behavior and randomly
+    # choose one UAV-positive sample.
+    # ---------------------------------------------------------------
+
+    selected_indices = (
+        args.index
+        if args.index is not None
+        else [None]
+    )
+
+    # Remove duplicates while preserving the requested order.
+    if args.index is not None:
+        selected_indices = list(
+            dict.fromkeys(selected_indices)
+        )
+
+    total_selected = len(selected_indices)
+
+    print(
+        "\n"
+        "============================================================"
+    )
+    print("FBAM + BHLR multi-index visualization")
+    print(
+        "============================================================"
+    )
+
+    if args.index is None:
+        print("Indices         : random positive sample")
+    else:
+        print(f"Indices         : {selected_indices}")
+
+    print(f"Total           : {total_selected}")
+    print(
+        "============================================================\n"
+    )
+
+    for position, current_index in enumerate(
+        selected_indices,
+        start=1,
+    ):
+        print(
+            "\n"
+            "############################################################"
+        )
+        print(
+            f"Visualizing {position}/{total_selected}: "
+            f"index={current_index}"
+        )
+        print(
+            "############################################################\n"
+        )
+
+        current_save_dir = args.save_dir
+
+        # visualize() already generates one unique directory per index when
+        # --save-dir is omitted. If the user explicitly gives --save-dir,
+        # add one child directory for every requested index to avoid overwrite.
+        if (
+            args.save_dir is not None
+            and total_selected > 1
+            and current_index is not None
+        ):
+            current_save_dir = str(
+                Path(args.save_dir)
+                .expanduser()
+                .resolve()
+                / f"index_{int(current_index):06d}"
+            )
+
+        visualize(
+            weights=args.weights,
+            split=args.split,
+            device_str=args.device,
+            rgb_yaml=args.rgb,
+            tir_yaml=args.tir,
+            rgb_imgsz=args.rgb_imgsz,
+            rgb_semantic_imgsz=args.rgb_semantic_imgsz,
+            tir_imgsz=args.tir_imgsz,
+            pair_mode=args.pair_mode,
+            index=current_index,
+            seed=args.seed,
+            align_scale=args.align_scale,
+            bhlr_scale=args.bhlr_scale,
+            conf=args.conf,
+            iou=args.iou,
+            max_det=args.max_det,
+            support_thr=args.support_thr,
+            save_dir=current_save_dir,
+        )
+
+    print(
+        "\n"
+        "============================================================"
+    )
+    print("All requested indices have been visualized.")
+    print(
+        "============================================================\n"
     )

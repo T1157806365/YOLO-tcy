@@ -1,0 +1,146 @@
+# ============================================================
+# FBAM + BHLR + explicit bbox-guided alignment supervision
+# UAV-CB / YOLO26n / RGB-high 1280 / RGB-semantic 640 / TIR 640
+# ============================================================
+traincc:
+  conda activate tcy
+  cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
+  mkdir -p logs
+  mkdir -p pid
+  nohup python -u train_fbam_bhlr.py \
+    --cfg configs/experiments/fb/uavcb_fbam_bhlr_yolo26n_1920_640_V2.yaml \
+    > logs/uavcb_fbamP3_bhlrP3_yolo26n_1920_640_V2.log 2>&1 &
+  echo $! > pid/uavcb_fbamP3_bhlrP3_yolo26n_1920_640_V2.pid
+  tail -f logs/uavcb_fbamP3_bhlrP3_yolo26n_1920_640_V2.log
+
+
+  conda activate tcy
+  cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
+  python val_fbam_bhlr.py \
+    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/fbam_bhlr/yolo26n_UAVCB_fbamP3_bhlrP3_rgb1920_sem640_tir640_seed0_V2/weights/best.pt \
+    --split test \
+    --rgb /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml \
+    --tir /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml \
+    --rgb-imgsz 1920 \
+    --rgb-semantic-imgsz 640 \
+    --tir-imgsz 640 \
+    --batch 4 \
+    --device 5 \
+    --plots \
+    --preview-num 6 \
+    --preview-conf 0.25 \
+    --preview-cols 3
+
+model:
+  name: yolo26n
+  pretrained: true
+  fusion: concat
+  align_mode: bilinear
+
+  bhlr_scales: [3]
+  high_to_semantic_ratio: 3
+  detail_channels: 64
+  stem_channels: 32
+  guide_channels: 32
+
+  bhlr_freq_cutoff: 0.15
+  bhlr_freq_sharpness: 24.0
+
+  alignment:
+    enabled: true
+    type: fbam
+    scales: [3]
+
+    hidden_channels: 32
+
+    # Keep the current capacity first.
+    # Do not enlarge it again until supervised-offset training is evaluated.
+    max_coarse_offset: 4.0
+    max_fine_offset: 2.0
+
+    freq_cutoff: 0.15
+    freq_sharpness: 24.0
+
+    use_confidence: true
+
+    use_for_bhlr: true
+    use_for_fusion: true
+
+
+data:
+  rgb: /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml
+  tir: /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml
+
+  rgb_imgsz: 1920
+  rgb_semantic_imgsz: 640
+  tir_imgsz: 640
+
+  pair_mode: relative
+
+
+train:
+  epochs: 300
+  batch: 8
+  workers: 4
+  device: 5
+
+  optimizer: SGD
+  lr0: 0.01
+  lrf: 0.01
+  momentum: 0.937
+  weight_decay: 0.0005
+
+  amp: true
+  seed: 0
+  deterministic: true
+  grad_clip: 10.0
+
+  patience: 50
+  early_stop_min_delta: 0.000001
+
+  resume: null
+
+  stage2:
+    enabled: true
+    epochs: 200
+    lr0: 0.001
+    lrf: 0.01
+    patience: 50
+    early_stop_min_delta: 0.000001
+
+
+augment:
+  fliplr: 0.5
+  flipud: 0.0
+
+
+loss:
+  # Original YOLO detection loss
+  box: 7.5
+  cls: 0.5
+  dfl: 1.5
+
+  # Explicit FBAM geometry supervision
+  alignment:
+    enabled: true
+
+    # L = Ldet + lambda_align * Lalign
+    lambda_align: 0.2
+
+    # Lalign = Lfinal + lambda_coarse * Lcoarse
+    lambda_coarse: 0.5
+
+    # P3 only for the current FBAM experiment
+    scales: [3]
+
+    # SmoothL1 in P3 feature-pixel offset units
+    smooth_l1_beta: 1.0
+
+    # If GT exceeds tanh-bounded model capacity, clamp it to the
+    # current FBAM reachable range.
+    clamp_gt_to_capacity: true
+
+
+output:
+  project: runs/fbam_bhlr
+  name: yolo26n_UAVCB_fbamP3_bhlrP3_rgb1920_sem640_tir640_seed0_V2

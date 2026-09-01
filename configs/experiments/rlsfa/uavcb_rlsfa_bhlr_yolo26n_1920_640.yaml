@@ -1,0 +1,153 @@
+# ============================================================
+# RLSFA + BHLR FINAL VERSION
+# UAV-CB / YOLO26n / RGB-high 1280 / RGB-semantic 640 / TIR 640
+# ============================================================
+traincc:
+  conda activate tcy
+  cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
+  mkdir -p logs
+  mkdir -p pid
+  nohup python -u train_rlsfa_bhlr.py \
+    --cfg /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/experiments/rlsfa/uavcb_rlsfa_bhlr_yolo26n_1920_640.yaml \
+    > logs/uavcb_rlsfaP3_bhlrP3_yolo26n_1920_640.log 2>&1 &
+  echo $! > pid/uavcb_rlsfaP3_bhlrP3_yolo26n_1920_640.pid
+  tail -f logs/uavcb_rlsfaP3_bhlrP3_yolo26n_1920_640.log
+
+
+  conda activate tcy
+  cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
+  python val_rlsfa_bhlr.py \
+    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rlsfa_bhlr/yolo26n_UAVCB_RLSFA-P3_BHLR-P3_rgb1920_sem640_tir640_seed0/weights/best.pt \
+    --split test \
+    --rgb /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml \
+    --tir /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml \
+    --rgb-imgsz 1920 \
+    --rgb-semantic-imgsz 640 \
+    --tir-imgsz 640 \
+    --batch 4 \
+    --device 5 \
+    --plots \
+    --preview-num 6 \
+    --preview-conf 0.25 \
+    --preview-cols 3
+
+model:
+  name: yolo26n
+  pretrained: true
+  fusion: concat
+  align_mode: bilinear
+
+  # ---------------- BHLR ----------------
+  bhlr_scales: [3]
+  high_to_semantic_ratio: 3
+  detail_channels: 64
+  stem_channels: 32
+  guide_channels: 32
+  bhlr_freq_cutoff: 0.15
+  bhlr_freq_sharpness: 24.0
+
+  # ---------------- RLSFA ----------------
+  alignment:
+    enabled: true
+    type: rlsfa
+    scales: [3]
+
+    hidden_channels: 32
+
+    # Coarse explicit correlation search
+    coarse_radius: 8
+    coarse_temperature: 0.1
+    use_targetness: true
+
+    # Learnable spatial structure
+    spatial_kernel_sizes: [3, 5]
+
+    # Local overlapping Window FFT
+    window_sizes: [4, 8]
+    window_overlap: 0.5
+    use_hann_window: true
+    freq_cutoff: 0.15
+    freq_sharpness: 24.0
+
+    # Independent modality frequency reliability
+    reliability_channels: 32
+
+    # Fine residual correlation search
+    fine_radius: 2
+    fine_temperature: 0.1
+    max_fine_offset: 1.0
+
+    # Route aligned TIR to BHLR and final concat fusion
+    use_for_bhlr: true
+    use_for_fusion: true
+
+
+data:
+  rgb: /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml
+  tir: /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml
+  rgb_imgsz: 1920
+  rgb_semantic_imgsz: 640
+  tir_imgsz: 640
+  pair_mode: relative
+
+train:
+  epochs: 300
+  batch: 8
+  workers: 4
+  device: 5
+
+  optimizer: SGD
+  lr0: 0.01
+  lrf: 0.01
+  momentum: 0.937
+  weight_decay: 0.0005
+
+  amp: true
+  seed: 0
+  deterministic: true
+  grad_clip: 10.0
+
+  patience: 50
+  early_stop_min_delta: 0.000001
+  resume: null
+
+  stage2:
+    enabled: true
+    epochs: 200
+    lr0: 0.001
+    lrf: 0.01
+    patience: 50
+    early_stop_min_delta: 0.000001
+
+augment:
+  fliplr: 0.5
+  flipud: 0.0
+
+loss:
+  box: 7.5
+  cls: 0.5
+  dfl: 1.5
+
+  alignment:
+    enabled: true
+    scales: [3]
+
+    # Ltotal = Ldet + lambda_align * Lalign
+    lambda_align: 0.2
+
+    # Lalign = Lfinal_translation
+    #        + lambda_coarse * Lcoarse_translation
+    #        + lambda_targetness * Ltargetness
+    #        + lambda_fine_reg * |fine_offset|
+    lambda_coarse: 0.5
+    lambda_targetness: 0.2
+    lambda_fine_reg: 0.02
+
+    smooth_l1_beta: 1.0
+    targetness_alpha: 0.75
+    targetness_gamma: 2.0
+    clamp_gt_to_capacity: true
+
+output:
+  project: runs/rlsfa_bhlr
+  name: yolo26n_UAVCB_RLSFA-P3_BHLR-P3_rgb1920_sem640_tir640_seed0

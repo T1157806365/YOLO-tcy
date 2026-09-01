@@ -176,11 +176,47 @@ class BHLRScaleAdapter(nn.Module):
             align_corners=False,
         )
 
-    def _compress_detail(self, detail_raw, rgb_feat):
+    def _compress_detail(
+        self,
+        detail_raw,
+        rgb_feat,
+        return_debug=False,
+    ):
+        """
+        Compress the shared high-resolution lost-detail bank to the current
+        pyramid scale.
+
+        Training computation is unchanged:
+            AvgPool(detail_raw)
+            MaxPool(detail_raw)
+            concat -> 1x1 projection
+
+        return_debug=True only exposes the already-computed intermediate
+        tensors for visualization; it does not add a new learnable operation.
+        """
         target = rgb_feat.shape[-2:]
-        avg = F.adaptive_avg_pool2d(detail_raw, target)
-        mx = F.adaptive_max_pool2d(detail_raw, target)
-        return self.detail_projection(torch.cat([avg, mx], dim=1))
+
+        avg = F.adaptive_avg_pool2d(
+            detail_raw,
+            target,
+        )
+
+        mx = F.adaptive_max_pool2d(
+            detail_raw,
+            target,
+        )
+
+        detail_scale = self.detail_projection(
+            torch.cat(
+                [avg, mx],
+                dim=1,
+            )
+        )
+
+        if not return_debug:
+            return detail_scale
+
+        return detail_scale, avg, mx
 
     def forward(self, detail_raw, rgb_feat, tir_feat, return_debug=False):
         if rgb_feat.shape[1] != self.rgb_channels:
@@ -200,7 +236,24 @@ class BHLRScaleAdapter(nn.Module):
         )
 
         # 2) Only the information lost by downsampling is used.
-        detail_scale = self._compress_detail(detail_raw, rgb_feat)
+        if return_debug:
+            (
+                detail_scale,
+                detail_avg,
+                detail_max,
+            ) = self._compress_detail(
+                detail_raw,
+                rgb_feat,
+                return_debug=True,
+            )
+        else:
+            detail_scale = self._compress_detail(
+                detail_raw,
+                rgb_feat,
+                return_debug=False,
+            )
+            detail_avg = None
+            detail_max = None
 
         # 3) Lost information is not always useful -> learned gate.
         gate = torch.sigmoid(
@@ -229,6 +282,8 @@ class BHLRScaleAdapter(nn.Module):
             "support_map": support,
             "rgb_boundary": rgb_boundary,
             "tir_boundary": tir_boundary,
+            "detail_avg": detail_avg,
+            "detail_max": detail_max,
             "detail_scale": detail_scale,
             "detail_gate": gate,
             "usable_detail": usable_detail,
@@ -325,6 +380,7 @@ class MultiScaleBHLRv1(nn.Module):
         )
         detail_raw = self.detail_stem(residual_s2d)
 
+        # Keep the original public return signature unchanged.
         return detail_raw, reconstructed_high, residual_high
 
     def forward(
@@ -347,9 +403,23 @@ class MultiScaleBHLRv1(nn.Module):
                 "scales": {},
             }
 
-        detail_raw, reconstructed_high, residual_high = (
-            self.build_lost_detail_bank(rgb_high, rgb_semantic)
+        (
+            detail_raw,
+            reconstructed_high,
+            residual_high,
+        ) = self.build_lost_detail_bank(
+            rgb_high,
+            rgb_semantic,
         )
+
+        # Visualization-only debug tensor. This repeats PixelUnshuffle only
+        # when return_debug=True and does not alter the training computation.
+        residual_s2d = None
+        if return_debug:
+            residual_s2d = F.pixel_unshuffle(
+                residual_high,
+                downscale_factor=self.ratio,
+            )
 
         outputs = {}
         debug_scales = {}
@@ -382,6 +452,7 @@ class MultiScaleBHLRv1(nn.Module):
             "equal_resolution": False,
             "reconstructed_high": reconstructed_high,
             "resolution_residual": residual_high,
+            "residual_s2d": residual_s2d,
             "detail_raw": detail_raw,
             "scales": debug_scales,
         }

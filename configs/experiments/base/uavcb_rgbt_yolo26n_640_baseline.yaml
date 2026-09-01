@@ -1,0 +1,196 @@
+# ============================================================
+# RLSFA + BHLR FINAL VERSION
+# UAV-CB / YOLO26n / RGB-high 1280 / RGB-semantic 640 / TIR 640
+# ============================================================
+traincc:
+  conda activate tcy
+  cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
+  mkdir -p logs
+  mkdir -p pid
+  nohup python -u train_rgbt.py \
+    --cfg configs/experiments/base/uavcb_rgbt_yolo26n_640_baseline.yaml \
+    > logs/uavcb_rgbt_yolo26n_640_baseline.log 2>&1 &
+  echo $! > pid/uavcb_rgbt_yolo26n_640_baseline.pid
+  tail -f logs/uavcb_rgbt_yolo26n_640_baseline.log
+
+
+  conda activate tcy
+  cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
+  python val_rgbt.py \
+    --weights /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/runs/rgbt_baseline/yolo26n_UAVCB_RGBT-baseline_rgb640_tir640_concat_seed0/weights/best.pt \
+    --split test \
+    --rgb /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml \
+    --tir /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml \
+    --rgb-imgsz 640 \
+    --tir-imgsz 640 \
+    --batch 8 \
+    --device 5 \
+    --plots \
+    --preview-num 6 \
+    --preview-conf 0.25 \
+    --preview-cols 3
+
+# ============================================================
+# RGB-T BASELINE
+# UAV-CB / YOLO26n
+#
+# NO RLSFA
+# NO BHLR
+#
+# RGB 640 + TIR 640
+# Dual Backbone
+# Direct Concat Fusion
+# Original YOLO26 Neck / Head
+# ============================================================
+
+
+# ============================================================
+# Model
+# ============================================================
+
+model:
+  name: yolo26n
+
+  pretrained: true
+
+  # Standard RGB-T feature fusion
+  fusion: concat
+
+  # Used only if feature spatial sizes need interpolation
+  align_mode: bilinear
+
+
+# ============================================================
+# Dataset
+# ============================================================
+
+data:
+  rgb: /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-RGB.yaml
+
+  tir: /mnt/sda/taochangyong/Projects/Model/YOLO-tcy/configs/datasets/UAV-CB-TIR.yaml
+
+  # ----------------------------------------------------------
+  # Baseline:
+  #
+  # Original high-resolution RGB is directly resized /
+  # LetterBoxed to 640 before entering RGB backbone.
+  #
+  # Therefore:
+  #   NO RGB-high branch
+  #   NO RGB-semantic/high dual input
+  #   NO BHLR
+  # ----------------------------------------------------------
+
+  rgb_imgsz: 640
+
+  tir_imgsz: 640
+
+  pair_mode: relative
+
+
+# ============================================================
+# Training
+# ============================================================
+
+train:
+  epochs: 300
+
+  batch: 8
+
+  workers: 4
+
+  device: 5
+
+
+  # ----------------------------------------------------------
+  # Optimizer
+  # ----------------------------------------------------------
+
+  optimizer: SGD
+
+  lr0: 0.01
+
+  lrf: 0.01
+
+  momentum: 0.937
+
+  weight_decay: 0.0005
+
+
+  # ----------------------------------------------------------
+  # Training settings
+  # ----------------------------------------------------------
+
+  amp: true
+
+  seed: 0
+
+  deterministic: true
+
+  grad_clip: 10.0
+
+
+  # ----------------------------------------------------------
+  # Early stopping
+  # ----------------------------------------------------------
+
+  patience: 50
+
+  early_stop_min_delta: 0.000001
+
+
+  # ----------------------------------------------------------
+  # Resume
+  # ----------------------------------------------------------
+
+  resume: null
+
+
+  # ----------------------------------------------------------
+  # Stage 2
+  # ----------------------------------------------------------
+
+  stage2:
+    enabled: true
+
+    epochs: 200
+
+    lr0: 0.001
+
+    lrf: 0.01
+
+    patience: 50
+
+    early_stop_min_delta: 0.000001
+
+
+# ============================================================
+# Augmentation
+# ============================================================
+
+augment:
+  fliplr: 0.5
+
+  flipud: 0.0
+
+
+# ============================================================
+# YOLO Detection Loss
+# ============================================================
+
+loss:
+  box: 7.5
+
+  cls: 0.5
+
+  dfl: 1.5
+
+
+# ============================================================
+# Output
+# ============================================================
+
+output:
+  project: runs/rgbt_baseline
+
+  name: yolo26n_UAVCB_RGBT-baseline_rgb640_tir640_concat_seed0

@@ -1,26 +1,4 @@
-"""
-Alignment plugin builder.
-
-Current supported built-in module:
-    identity
-
-Future modules can be added WITHOUT changing the detector.
-
-Two future usage modes
-----------------------
-
-A) Add a built-in name to BUILTIN_ALIGNMENTS.
-
-B) No builder modification at all:
-   point YAML `target` to a Python class:
-
-alignment:
-  enabled: true
-  type: custom
-  target: models.modules.alignment.offset_alignment:OffsetAlignment
-
-The target class only needs to inherit BaseAlignment and obey its forward API.
-"""
+"""Alignment plugin builder."""
 
 from __future__ import annotations
 
@@ -30,153 +8,48 @@ from typing import Any, Dict, Type
 from .base import BaseAlignment
 from .identity import IdentityAlignment
 from .fbam import FBAMAlignment
+from .rlsfa import RLSFAAlignment
+
 
 BUILTIN_ALIGNMENTS = {
-    "identity":
-        IdentityAlignment,
-    "fbam":
-        FBAMAlignment,
+    "identity": IdentityAlignment,
+    "fbam": FBAMAlignment,       # legacy V1 baseline
+    "rlsfa": RLSFAAlignment,     # new main version
 }
 
 
-def _load_target(
-    target: str,
-) -> Type[BaseAlignment]:
-    """
-    Dynamic class loader.
-
-    target format:
-        package.module:ClassName
-    """
-
+def _load_target(target: str) -> Type[BaseAlignment]:
     if ":" not in target:
         raise ValueError(
-            "alignment.target 必须使用 "
-            "'package.module:ClassName' 格式，"
-            f"当前为: {target}"
+            "alignment.target must use 'package.module:ClassName', "
+            f"got: {target}"
         )
-
-    module_name, class_name = (
-        target.split(
-            ":",
-            1,
-        )
-    )
-
-    module = importlib.import_module(
-        module_name
-    )
-
-    if not hasattr(
-        module,
-        class_name,
-    ):
-        raise AttributeError(
-            f"{module_name} 中不存在 "
-            f"{class_name}"
-        )
-
-    cls = getattr(
-        module,
-        class_name,
-    )
-
-    if not isinstance(
-        cls,
-        type,
-    ):
-        raise TypeError(
-            f"{target} 不是 Python class。"
-        )
-
-    if not issubclass(
-        cls,
-        BaseAlignment,
-    ):
-        raise TypeError(
-            f"{target} 必须继承 BaseAlignment。"
-        )
-
+    module_name, class_name = target.split(":", 1)
+    module = importlib.import_module(module_name)
+    if not hasattr(module, class_name):
+        raise AttributeError(f"{module_name} has no class {class_name}")
+    cls = getattr(module, class_name)
+    if not isinstance(cls, type):
+        raise TypeError(f"{target} is not a Python class")
+    if not issubclass(cls, BaseAlignment):
+        raise TypeError(f"{target} must inherit BaseAlignment")
     return cls
 
 
-def build_alignment(
-    cfg: Dict[str, Any] | None = None,
-) -> BaseAlignment:
-    """
-    Build an optional RGB-T alignment plugin.
+def build_alignment(cfg: Dict[str, Any] | None = None) -> BaseAlignment:
+    cfg = dict(cfg or {})
+    if not bool(cfg.get("enabled", False)):
+        return IdentityAlignment(cfg=cfg)
 
-    Important
-    ---------
-    enabled=false always returns IdentityAlignment.
-    Therefore alignment can be disabled without any detector-side branch.
-    """
-
-    cfg = dict(
-        cfg or {}
-    )
-
-    enabled = bool(
-        cfg.get(
-            "enabled",
-            False,
-        )
-    )
-
-    # -------------------------------------------------------
-    # Current default: alignment OFF
-    # -------------------------------------------------------
-    if not enabled:
-        return IdentityAlignment(
-            cfg=cfg
-        )
-
-    align_type = str(
-        cfg.get(
-            "type",
-            "identity",
-        )
-    ).strip().lower()
-
-    # -------------------------------------------------------
-    # Built-in plugins
-    # -------------------------------------------------------
+    align_type = str(cfg.get("type", "identity")).strip().lower()
     if align_type in BUILTIN_ALIGNMENTS:
-        cls = BUILTIN_ALIGNMENTS[
-            align_type
-        ]
+        return BUILTIN_ALIGNMENTS[align_type](cfg=cfg)
 
-        return cls(
-            cfg=cfg
-        )
-
-    # -------------------------------------------------------
-    # Future external/custom plugin
-    # -------------------------------------------------------
-    target = cfg.get(
-        "target",
-        None,
-    )
-
+    target = cfg.get("target", None)
     if not target:
         raise NotImplementedError(
-            "\n当前尚未实现真正的对齐算法。\n"
-            f"alignment.type={align_type!r}\n"
-            "如果以后新增插件，请设置例如：\n"
-            "alignment:\n"
-            "  enabled: true\n"
-            "  type: custom\n"
-            "  target: "
-            "models.modules.alignment."
-            "offset_alignment:OffsetAlignment\n"
+            f"Unknown alignment.type={align_type!r}. "
+            "Use a built-in type or set alignment.target="
+            "'package.module:ClassName'."
         )
-
-    cls = _load_target(
-        str(
-            target
-        )
-    )
-
-    return cls(
-        cfg=cfg
-    )
+    return _load_target(str(target))(cfg=cfg)
