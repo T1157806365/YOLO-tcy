@@ -11,7 +11,7 @@ RLSFA ALIGNMENT -- only key stages
 05_coarse_targetness.jpg
 06_tir_after_coarse.jpg
 07_local_spatial_frequency_panel.jpg
-08_fine_correlation.jpg
+08_fine_displacement_probability.jpg
 09_total_offset.jpg
 10_rgb_tir_after_final_rlsfa.jpg
 BHLR HIGH-RESOLUTION LOST-DETAIL RECOVERY
@@ -44,7 +44,7 @@ Example
 conda activate tcy
 cd /mnt/sda/taochangyong/Projects/Model/YOLO-tcy
 python visualize_rlsfa_bhlr_internal.py \
-  --weights runs/rlsfa_bhlr/yolo26n_UAVCB_RLSFA-P3_BHLR-P3_rgb1280_sem640_tir640_seed0/weights/best.pt \
+  --weights runs/rlsfa_bhlr/yolo26n_UAVCB_RLSFA-P3_BHLR-P3_rgb1920_sem640_tir640_seed0/weights/best.pt \
   --split test \
   --device 5 \
   --index 0 100 200 300 400 500 600
@@ -63,6 +63,11 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:  # Pillow is optional; OpenCV fallback remains available.
+    Image = ImageDraw = ImageFont = None
 
 import val_rgbt as base_val
 
@@ -189,6 +194,244 @@ def overlay_heatmap(
     return cv2.addWeighted(base, 1.0 - alpha, hm, alpha, 0.0)
 
 
+def render_displacement_probability(
+    probability: torch.Tensor,
+    fine_offset: torch.Tensor,
+    fine_confidence: Optional[torch.Tensor] = None,
+) -> np.ndarray:
+    """
+    Visualize RLSFA fine matching as a displacement-probability matrix.
+
+    The current RLSFA fine matcher does NOT return a spatial HxW correlation
+    map. It returns a probability distribution over candidate residual
+    translations. With fine_radius=2, the distribution has 25 candidates and
+    is reshaped to a 5x5 matrix:
+
+        rows    -> dy = -2, -1, 0, +1, +2
+        columns -> dx = -2, -1, 0, +1, +2
+
+    This is the faithful visualization of the actual fine-correlation search.
+    """
+    p = probability.detach().float().cpu()
+
+    # Current RLSFA returns [B, K]. Keep the first visualization sample.
+    while p.ndim > 1:
+        p = p[0]
+    p = p.reshape(-1)
+
+    k = int(p.numel())
+    side = int(round(math.sqrt(k)))
+    if side * side != k or side % 2 == 0:
+        raise ValueError(
+            "fine_probability must contain an odd square number of candidate "
+            f"translations, got K={k}"
+        )
+
+    radius = (side - 1) // 2
+    prob = p.numpy().reshape(side, side)
+
+    # Use the original RGB source resolution as the drawing canvas whenever
+    # available. save_image() will therefore not need to shrink this figure.
+    width = int(_EXPORT_REFERENCE_W or 1280)
+    height = int(_EXPORT_REFERENCE_H or 720)
+    width = max(width, 900)
+    height = max(height, 700)
+
+    canvas = np.full((height, width, 3), 246, dtype=np.uint8)
+
+    scale_ref = max(1.0, min(width / 1280.0, height / 720.0))
+    left = int(round(180 * scale_ref))
+    right = int(round(80 * scale_ref))
+    top = int(round(120 * scale_ref))
+    bottom = int(round(150 * scale_ref))
+
+    usable_w = max(1, width - left - right)
+    usable_h = max(1, height - top - bottom)
+    cell = max(20, min(usable_w // side, usable_h // side))
+
+    grid_w = cell * side
+    grid_h = cell * side
+    x0 = left + max(0, (usable_w - grid_w) // 2)
+    y0 = top + max(0, (usable_h - grid_h) // 2)
+
+    # Color uses relative probability only for visualization. Actual numeric
+    # probabilities are printed inside every cell.
+    pmax = float(prob.max()) if prob.size else 0.0
+    if pmax <= 1e-12:
+        color_norm = np.zeros_like(prob, dtype=np.float32)
+    else:
+        color_norm = np.clip(prob / pmax, 0.0, 1.0).astype(np.float32)
+
+    best_flat = int(np.argmax(prob))
+    best_row, best_col = divmod(best_flat, side)
+    best_dx = best_col - radius
+    best_dy = best_row - radius
+
+    for row in range(side):
+        for col in range(side):
+            value = float(prob[row, col])
+            color_value = int(round(float(color_norm[row, col]) * 255.0))
+            color = cv2.applyColorMap(
+                np.array([[color_value]], dtype=np.uint8),
+                cv2.COLORMAP_TURBO,
+            )[0, 0]
+            color = tuple(int(v) for v in color.tolist())
+
+            xa = x0 + col * cell
+            ya = y0 + row * cell
+            xb = xa + cell
+            yb = ya + cell
+
+            cv2.rectangle(canvas, (xa, ya), (xb, yb), color, -1)
+            cv2.rectangle(
+                canvas,
+                (xa, ya),
+                (xb, yb),
+                (35, 35, 35),
+                max(1, int(round(scale_ref))),
+            )
+
+            # White outline marks the highest-probability discrete candidate.
+            if row == best_row and col == best_col:
+                cv2.rectangle(
+                    canvas,
+                    (xa + 3, ya + 3),
+                    (xb - 3, yb - 3),
+                    (255, 255, 255),
+                    max(3, int(round(4 * scale_ref))),
+                )
+
+            # Choose text color from cell brightness.
+            brightness = 0.114 * color[0] + 0.587 * color[1] + 0.299 * color[2]
+            text_color = (20, 20, 20) if brightness > 145 else (255, 255, 255)
+            label = f"{value:.3f}"
+            font_scale = max(0.42, 0.58 * scale_ref)
+            thickness = max(1, int(round(scale_ref)))
+            (tw, th), _ = cv2.getTextSize(
+                label,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                thickness,
+            )
+            tx = xa + max(4, (cell - tw) // 2)
+            ty = ya + max(th + 4, (cell + th) // 2)
+            cv2.putText(
+                canvas,
+                label,
+                (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                text_color,
+                thickness,
+                cv2.LINE_AA,
+            )
+
+    # dx labels along the top.
+    axis_scale = max(0.50, 0.62 * scale_ref)
+    axis_thickness = max(1, int(round(scale_ref)))
+    for col in range(side):
+        dx = col - radius
+        label = f"{dx:+d}" if dx != 0 else "0"
+        (tw, _), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, axis_scale, axis_thickness
+        )
+        cx = x0 + col * cell + cell // 2
+        cv2.putText(
+            canvas,
+            label,
+            (cx - tw // 2, y0 - int(round(18 * scale_ref))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            axis_scale,
+            (35, 35, 35),
+            axis_thickness,
+            cv2.LINE_AA,
+        )
+
+    # dy labels along the left.
+    for row in range(side):
+        dy = row - radius
+        label = f"{dy:+d}" if dy != 0 else "0"
+        (tw, th), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, axis_scale, axis_thickness
+        )
+        cy = y0 + row * cell + cell // 2
+        cv2.putText(
+            canvas,
+            label,
+            (x0 - tw - int(round(24 * scale_ref)), cy + th // 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            axis_scale,
+            (35, 35, 35),
+            axis_thickness,
+            cv2.LINE_AA,
+        )
+
+    cv2.putText(
+        canvas,
+        "dx (P3 pixels)",
+        (x0, max(35, y0 - int(round(65 * scale_ref)))),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        max(0.55, 0.68 * scale_ref),
+        (30, 30, 30),
+        max(1, int(round(scale_ref))),
+        cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        canvas,
+        "dy",
+        (max(18, x0 - int(round(110 * scale_ref))), y0 + grid_h // 2),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        max(0.55, 0.68 * scale_ref),
+        (30, 30, 30),
+        max(1, int(round(scale_ref))),
+        cv2.LINE_AA,
+    )
+
+    off = fine_offset.detach().float().cpu()
+    fine_dx = float(off.reshape(off.shape[0], off.shape[1], -1)[0, 0, 0])
+    fine_dy = float(off.reshape(off.shape[0], off.shape[1], -1)[0, 1, 0])
+
+    conf_text = "N/A"
+    if fine_confidence is not None:
+        c = fine_confidence.detach().float().cpu().reshape(-1)
+        if c.numel() > 0:
+            conf_text = f"{float(c[0]):.4f}"
+
+    info_y = min(height - int(round(65 * scale_ref)), y0 + grid_h + int(round(55 * scale_ref)))
+    line1 = (
+        f"argmax candidate: dx={best_dx:+d}, dy={best_dy:+d} P3 px   "
+        f"p_max={float(prob[best_row, best_col]):.4f}"
+    )
+    line2 = (
+        f"predicted fine offset: dx={fine_dx:+.4f}, dy={fine_dy:+.4f} P3 px   "
+        f"confidence={conf_text}"
+    )
+
+    cv2.putText(
+        canvas,
+        line1,
+        (max(20, x0 - int(round(80 * scale_ref))), info_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        max(0.48, 0.60 * scale_ref),
+        (30, 30, 30),
+        max(1, int(round(scale_ref))),
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        line2,
+        (max(20, x0 - int(round(80 * scale_ref))), info_y + int(round(36 * scale_ref))),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        max(0.48, 0.60 * scale_ref),
+        (30, 30, 30),
+        max(1, int(round(scale_ref))),
+        cv2.LINE_AA,
+    )
+
+    return canvas
+
+
 # ---------------------------------------------------------------------------
 # Full-resolution export
 # ---------------------------------------------------------------------------
@@ -247,24 +490,87 @@ def fit_to_export_reference(image: np.ndarray) -> np.ndarray:
     return canvas
 
 
+def _unicode_font(size: int, bold: bool = False):
+    """Return a local Unicode-capable font when Pillow is available."""
+    if ImageFont is None:
+        return None
+
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
+    for font_path in candidates:
+        if Path(font_path).exists():
+            try:
+                return ImageFont.truetype(font_path, size=max(8, int(size)))
+            except Exception:
+                pass
+    return None
+
+
+def _put_unicode_text(
+    image_bgr: np.ndarray,
+    text: str,
+    xy: Tuple[int, int],
+    font_size: int,
+    color_bgr: Tuple[int, int, int] = (25, 25, 25),
+    bold: bool = False,
+) -> np.ndarray:
+    """Draw Unicode text (including Δ) with Pillow, falling back to OpenCV."""
+    if not text:
+        return image_bgr
+
+    font = _unicode_font(font_size, bold=bold)
+    if Image is not None and ImageDraw is not None and font is not None:
+        rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        draw = ImageDraw.Draw(pil)
+        color_rgb = (int(color_bgr[2]), int(color_bgr[1]), int(color_bgr[0]))
+        draw.text((int(xy[0]), int(xy[1])), text, font=font, fill=color_rgb)
+        return cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
+
+    # Fallback cannot reliably render Greek Delta, so use ASCII spelling.
+    fallback = text.replace("Δ", "Delta_")
+    cv2.putText(
+        image_bgr,
+        fallback,
+        (int(xy[0]), int(xy[1] + font_size)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        max(0.42, font_size / 32.0),
+        color_bgr,
+        max(1, int(round(font_size / 18.0))),
+        cv2.LINE_AA,
+    )
+    return image_bgr
+
+
 def add_title(
     image: np.ndarray,
     title: str,
     subtitle: str = "",
+    annotation: str = "",
     bar_h: int = 68,
 ) -> np.ndarray:
-    """Draw title INSIDE the image so saved pixel size is unchanged."""
+    """
+    Draw a white information strip INSIDE the image so saved pixel size is unchanged.
+
+    annotation is intended for RLSFA offset decomposition, e.g.:
+        Δcoarse=(dx,dy) | Δfine=(dx,dy) | Δtotal=(dx,dy)
+    """
     image = ensure_bgr(image).copy()
     h, w = image.shape[:2]
 
-    # Scale the title band/fonts with the exported image resolution.
     scale_ref = max(1.0, min(w / 1280.0, h / 720.0))
-    band_h = int(round(max(bar_h, 68 * scale_ref)))
-    band_h = min(band_h, max(68, h // 4))
+    base_h = 98 if annotation else 68
+    band_h = int(round(max(bar_h, base_h * scale_ref)))
+    band_h = min(band_h, max(base_h, h // 3))
 
-    overlay = image.copy()
-    cv2.rectangle(overlay, (0, 0), (w, band_h), (248, 248, 248), -1)
-    image = cv2.addWeighted(overlay, 0.88, image, 0.12, 0.0)
+    # Opaque white strip: easier to read than a semitransparent overlay.
+    cv2.rectangle(image, (0, 0), (w, band_h), (248, 248, 248), -1)
 
     title_scale = 0.68 * scale_ref
     subtitle_scale = 0.45 * scale_ref
@@ -295,6 +601,18 @@ def add_title(
             cv2.LINE_AA,
         )
 
+    if annotation:
+        ann_y = int(round(68 * scale_ref))
+        ann_size = int(round(18 * scale_ref))
+        image = _put_unicode_text(
+            image,
+            annotation,
+            (x, min(ann_y, band_h - ann_size - 4)),
+            font_size=ann_size,
+            color_bgr=(30, 30, 30),
+            bold=True,
+        )
+
     return image
 
 
@@ -304,13 +622,14 @@ def save_image(
     image: np.ndarray,
     title: str,
     subtitle: str = "",
+    annotation: str = "",
 ) -> np.ndarray:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Small 640/80-derived visualizations are exported on an original-RGB
     # resolution canvas. Large RGB-high images/panels are never downsampled.
     image = fit_to_export_reference(image)
-    titled = add_title(image, title, subtitle)
+    titled = add_title(image, title, subtitle, annotation=annotation)
 
     path = out_dir / filename
     params = [cv2.IMWRITE_JPEG_QUALITY, 97]
@@ -566,6 +885,103 @@ def draw_translation_arrow(
         1,
         cv2.LINE_AA,
     )
+
+    return image
+
+
+def draw_translation_decomposition(
+    base: np.ndarray,
+    coarse_offset: torch.Tensor,
+    fine_offset: torch.Tensor,
+    total_offset: torch.Tensor,
+    feature_stride: float,
+) -> np.ndarray:
+    """
+    Visualize the decomposition of RLSFA translation.
+
+    Offsets are sampling displacements, so visual content motion is -delta.
+    - coarse: center -> coarse endpoint
+    - fine  : coarse endpoint -> final endpoint
+    - total : center -> final endpoint
+    """
+    image = ensure_bgr(base).copy()
+    h, w = image.shape[:2]
+    start = np.array([w / 2.0, h / 2.0], dtype=np.float32)
+
+    def _xy(t: torch.Tensor) -> np.ndarray:
+        td = t.detach().float().cpu()
+        return np.array(
+            [float(td[0, 0, 0, 0]), float(td[0, 1, 0, 0])],
+            dtype=np.float32,
+        )
+
+    dc = _xy(coarse_offset)
+    df = _xy(fine_offset)
+    dt = _xy(total_offset)
+
+    coarse_end = start - dc * float(feature_stride)
+    final_end = start - dt * float(feature_stride)
+
+    def _pt(v):
+        return (int(round(float(v[0]))), int(round(float(v[1]))))
+
+    # Coarse visual motion: blue.
+    cv2.arrowedLine(
+        image,
+        _pt(start),
+        _pt(coarse_end),
+        (255, 120, 0),
+        4,
+        tipLength=0.12,
+    )
+
+    # Fine residual motion: orange, starting where coarse ended.
+    cv2.arrowedLine(
+        image,
+        _pt(coarse_end),
+        _pt(final_end),
+        (0, 165, 255),
+        4,
+        tipLength=0.18,
+    )
+
+    # Total motion: red, drawn slightly thinner so all three remain visible.
+    cv2.arrowedLine(
+        image,
+        _pt(start),
+        _pt(final_end),
+        (0, 0, 255),
+        2,
+        tipLength=0.10,
+    )
+
+    # Mark the three key locations.
+    cv2.circle(image, _pt(start), 6, (255, 255, 255), -1)
+    cv2.circle(image, _pt(start), 6, (30, 30, 30), 2)
+    cv2.circle(image, _pt(coarse_end), 6, (255, 120, 0), -1)
+    cv2.circle(image, _pt(final_end), 6, (0, 0, 255), -1)
+
+    # Compact legend near the bottom; the numerical values stay in the white header.
+    legend_y = max(24, h - 28)
+    legend = [
+        ("coarse", (255, 120, 0)),
+        ("fine", (0, 165, 255)),
+        ("total", (0, 0, 255)),
+    ]
+    x = 18
+    for name, color in legend:
+        cv2.line(image, (x, legend_y), (x + 34, legend_y), color, 4)
+        cv2.putText(
+            image,
+            name,
+            (x + 42, legend_y + 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+        x += 126
 
     return image
 
@@ -897,13 +1313,21 @@ def visualize_one(
     out_dir.mkdir(parents=True, exist_ok=True)
     overview_panels: List[Tuple[str, np.ndarray]] = []
 
-    def save(number: int, slug: str, image: np.ndarray, title: str, subtitle: str = ""):
+    def save(
+        number: int,
+        slug: str,
+        image: np.ndarray,
+        title: str,
+        subtitle: str = "",
+        annotation: str = "",
+    ):
         save_image(
             out_dir,
             f"{number:02d}_{slug}.jpg",
             image,
             title,
             subtitle,
+            annotation=annotation,
         )
         overview_panels.append((slug, image))
 
@@ -999,6 +1423,26 @@ def visualize_one(
     )
 
     coarse_offset = debug_get(align, "coarse_offset")
+    fine_offset = debug_get(align, "fine_offset")
+    total_offset = debug_get(align, "total_offset")
+
+    def _offset_xy(t: torch.Tensor) -> Tuple[float, float]:
+        td = t.detach().float().cpu()
+        return (
+            float(td[0, 0, 0, 0]),
+            float(td[0, 1, 0, 0]),
+        )
+
+    coarse_dx, coarse_dy = _offset_xy(coarse_offset)
+    fine_dx, fine_dy = _offset_xy(fine_offset)
+    total_dx, total_dy = _offset_xy(total_offset)
+
+    offset_annotation = (
+        f"Δcoarse=({coarse_dx:+.3f}, {coarse_dy:+.3f})  |  "
+        f"Δfine=({fine_dx:+.3f}, {fine_dy:+.3f})  |  "
+        f"Δtotal=({total_dx:+.3f}, {total_dy:+.3f})  P3 px  [sampling offset]"
+    )
+
     fh, fw = raw_tir_p3.shape[-2:]
     coarse_preview_tensor = warp_image_translation_preview(
         batch["tir_img"],
@@ -1027,6 +1471,7 @@ def visualize_one(
         coarse_panel,
         "Coarse translation result",
         "Left: original TIR coordinate; right: TIR translated toward RGB reference",
+        annotation=offset_annotation,
     )
 
     tir_spatial = debug_get(align, "tir_spatial", "tir_spatial_structure")
@@ -1099,42 +1544,41 @@ def visualize_one(
         structural_panel,
         "Local spatial-frequency reliability",
         "Q_T=1 prefers local frequency; Q_T=0 prefers spatial structure",
+        annotation=offset_annotation,
     )
 
-    fine_corr = debug_get(
+    # Fine matcher output is a probability distribution over candidate
+    # residual translations, NOT an HxW spatial correlation map.
+    fine_probability = debug_get(align, "fine_probability")
+    fine_confidence = debug_get(
         align,
-        "fine_correlation_map",
         "fine_correlation_confidence",
     )
-    fine_corr_map = debug_tensor_to_2d(
-        fine_corr,
-        fallback_hw=(fh, fw),
-    )
-    fine_corr_img = draw_boxes(
-        overlay_heatmap(
-            rgb_semantic,
-            fine_corr_map,
-            alpha=0.56,
-            robust=False,
-        ),
-        semantic_boxes,
+    fine_offset_for_vis = fine_offset
+
+    fine_prob_img = render_displacement_probability(
+        probability=fine_probability,
+        fine_offset=fine_offset_for_vis,
+        fine_confidence=fine_confidence,
     )
 
     save(
         8,
-        "fine_correlation",
-        fine_corr_img,
-        "Fine correlation",
-        "Semantic + reliability-selected local structure",
+        "fine_displacement_probability",
+        fine_prob_img,
+        "Fine residual displacement probability",
+        "rows=dy, columns=dx; white box = maximum-probability candidate",
+        annotation=offset_annotation,
     )
 
-    total_offset = debug_get(align, "total_offset")
+    # total_offset was already fetched above for the shared header annotation.
     feature_stride = float(rgb_semantic.shape[1]) / float(fw)
-    offset_img = draw_translation_arrow(
+    offset_img = draw_translation_decomposition(
         rgb_semantic,
-        total_offset,
-        feature_stride,
-        "Total translation",
+        coarse_offset=coarse_offset,
+        fine_offset=fine_offset,
+        total_offset=total_offset,
+        feature_stride=feature_stride,
     )
     offset_img = draw_boxes(offset_img, semantic_boxes)
 
@@ -1144,6 +1588,7 @@ def visualize_one(
         offset_img,
         "Final RLSFA translation",
         "coarse + fine; translation only, no dense deformation",
+        annotation=offset_annotation,
     )
 
     final_preview_tensor = warp_image_translation_preview(
@@ -1188,6 +1633,7 @@ def visualize_one(
         final_panel,
         "Final RLSFA alignment",
         "The final transform is one global TIR translation",
+        annotation=offset_annotation,
     )
 
     # =====================================================================
@@ -1634,11 +2080,18 @@ def visualize_one(
     # =====================================================================
     coarse_dx = float(coarse_offset[0, 0, 0, 0].detach().float().cpu())
     coarse_dy = float(coarse_offset[0, 1, 0, 0].detach().float().cpu())
-    fine_offset = debug_get(align, "fine_offset")
-    fine_dx = float(fine_offset[0, 0, 0, 0].detach().float().cpu())
-    fine_dy = float(fine_offset[0, 1, 0, 0].detach().float().cpu())
-    total_dx = float(total_offset[0, 0, 0, 0].detach().float().cpu())
-    total_dy = float(total_offset[0, 1, 0, 0].detach().float().cpu())
+    # coarse/fine/total offsets were already extracted above for the visual header.
+
+    fine_prob_cpu = fine_probability.detach().float().cpu()
+    if fine_prob_cpu.ndim > 1:
+        fine_prob_cpu = fine_prob_cpu[0]
+    fine_prob_cpu = fine_prob_cpu.reshape(-1)
+    fine_side = int(round(math.sqrt(int(fine_prob_cpu.numel()))))
+    fine_radius_vis = (fine_side - 1) // 2
+    fine_best = int(torch.argmax(fine_prob_cpu).item())
+    fine_best_row, fine_best_col = divmod(fine_best, fine_side)
+    fine_argmax_dx = int(fine_best_col - fine_radius_vis)
+    fine_argmax_dy = int(fine_best_row - fine_radius_vis)
 
     rgb_rel = debug_get(
         align,
@@ -1662,6 +2115,10 @@ def visualize_one(
             "coarse_dy": coarse_dy,
             "fine_dx": fine_dx,
             "fine_dy": fine_dy,
+            "fine_confidence": float(fine_confidence.detach().float().cpu().reshape(-1)[0]),
+            "fine_probability_max": float(fine_probability.detach().float().cpu().max()),
+            "fine_argmax_dx": fine_argmax_dx,
+            "fine_argmax_dy": fine_argmax_dy,
             "total_dx": total_dx,
             "total_dy": total_dy,
             "rgb_frequency_reliability_mean": float(rgb_rel.mean().detach().cpu()),
