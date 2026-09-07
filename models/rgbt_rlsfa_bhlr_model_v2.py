@@ -1,31 +1,69 @@
 """
-RGB-T detector with:
-  Module-1: RLSFA
-  Module-2: BHLR-v2
-  Fusion  : existing concat + 1x1 Conv
-  Module-3: OFF
+RLSFA + BHLR-v2 ANY-LAYER detector wrapper
+===========================================
 
-RLSFA training supervision:
-  coarse translation GT = C_TIR - C_RGB
-  final translation GT  = C_TIR - C_RGB
-  targetness             = RGB bbox mask on feature grid
-  fine regularization    = |fine_offset|
+Purpose
+-------
+Allow BHLR-v2 to be injected after ANY RGB backbone layer by actual layer ID,
+while ensuring the enhancement propagates into all later backbone layers.
 
-No affine supervision and no dense deformation.
+Why inline injection is required
+--------------------------------
+Wrong:
+    run complete backbone
+    -> change outputs[layer_id]
+
+For an early layer this does NOT affect later layers because they were already
+computed.
+
+Correct:
+    execute backbone layer by layer
+    -> after selected layer: BHLR(x)
+    -> store enhanced x
+    -> continue to next layer
+
+Configuration
+-------------
+Use actual backbone layer IDs:
+
+    model:
+      bhlr_layers: [2]
+
+or:
+
+    model:
+      bhlr_layers: [2, 4, 6]
+
+For YOLO26n semantic 640, commonly:
+    layer 0 : 320x320
+    layer 1 : 160x160
+    layer 2 : 160x160   (often treated as P2-level feature)
+    layer 4 : 80x80     (P3)
+    layer 6 : 40x40     (P4)
+    layer 10: 20x20     (P5)
+
+Do not assume these IDs for another model YAML; call print_backbone_table().
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Union
 
 import torch
 import torch.nn.functional as F
 
+from models.rgbt_model import get_layer_input
 from models.rgbt_rsdt_model import RGBTRSDTDetectionModel
 from models.modules.bhlr_v2 import MultiScaleBHLRv2
 
 
-class RGBTRLSFABHLRV2DetectionModel(RGBTRSDTDetectionModel):
+class RGBTRLSFABHLRAnyLayerDetectionModel(RGBTRSDTDetectionModel):
+    """
+    Drop-in experimental wrapper for arbitrary-layer BHLR injection.
+
+    ``bhlr_layers`` are ACTUAL backbone layer indices, not P-level labels.
+    """
+
     def __init__(
         self,
         model_name: str = "yolo26n",
@@ -36,13 +74,27 @@ class RGBTRLSFABHLRV2DetectionModel(RGBTRSDTDetectionModel):
         align_mode: str = "bilinear",
         names: Optional[Union[Dict[int, str], Sequence[str]]] = None,
         semantic_imgsz: int = 640,
-        bhlr_scales: Iterable[int] = (3,),
+
+        # NEW: actual backbone layer indices.
+        # Example: [2, 4, 6]
+        bhlr_layers: Optional[Iterable[int]] = None,
+
+        # Legacy compatibility with the existing trainer/config.
+        # If bhlr_layers is omitted, bhlr_scales=[3,4,5] is mapped
+        # through the model's P3/P4/P5 fusion indices.
+        bhlr_scales: Optional[Iterable[int]] = None,
+
         high_to_semantic_ratio: int = 2,
-        detail_channels: int = 64,
-        stem_channels: int = 32,
-        guide_channels: int = 32,
+        detail_channels: int = 48,
+        stem_channels: int = 16,
+        guide_channels: int = 24,
         bhlr_freq_cutoff: float = 0.15,
         bhlr_freq_sharpness: float = 24.0,
+
+        guidance_mode: str = "auto",
+        detach_external_guidance: bool = True,
+        external_structure_channels: int = 32,
+
         alignment_cfg: Optional[Dict[str, Any]] = None,
         alignment_loss_cfg: Optional[Dict[str, Any]] = None,
         verbose: bool = True,
@@ -50,52 +102,72 @@ class RGBTRLSFABHLRV2DetectionModel(RGBTRSDTDetectionModel):
         alignment_cfg = dict(alignment_cfg or {})
         alignment_loss_cfg = dict(alignment_loss_cfg or {})
 
-        # BHLR-v2 settings are intentionally stored inside alignment_cfg so
-        # train_rlsfa_bhlr.py / val_rlsfa_bhlr.py do NOT need to be modified.
-        #
-        # YAML:
-        #   alignment:
-        #     bhlr_guidance_mode: auto      # auto | fallback | external
-        #     bhlr_detach_external_guidance: true
-        self.bhlr_guidance_mode = str(
-            alignment_cfg.get("bhlr_guidance_mode", "auto")
-        ).strip().lower()
-        self.bhlr_detach_external_guidance = bool(
-            alignment_cfg.get("bhlr_detach_external_guidance", True)
-        )
-
-        if "use_for_bhlr" in alignment_cfg:
-            alignment_cfg["use_for_rsdt"] = bool(alignment_cfg["use_for_bhlr"])
-
+        # ----------------------------------------------------------
+        # RLSFA auxiliary supervision configuration.
+        # Kept compatible with the original RLSFA+BHLR-v2 trainer.
+        # ----------------------------------------------------------
         self.alignment_loss_cfg = alignment_loss_cfg
-        self.alignment_loss_enabled = bool(alignment_loss_cfg.get("enabled", False))
-        self.lambda_align = float(alignment_loss_cfg.get("lambda_align", 0.2))
-        self.lambda_coarse = float(alignment_loss_cfg.get("lambda_coarse", 0.5))
-        self.lambda_targetness = float(alignment_loss_cfg.get("lambda_targetness", 0.2))
-        self.lambda_fine_reg = float(alignment_loss_cfg.get("lambda_fine_reg", 0.02))
-        self.smooth_l1_beta = float(alignment_loss_cfg.get("smooth_l1_beta", 1.0))
-        self.targetness_alpha = float(alignment_loss_cfg.get("targetness_alpha", 0.75))
-        self.targetness_gamma = float(alignment_loss_cfg.get("targetness_gamma", 2.0))
-        self.clamp_gt_to_capacity = bool(alignment_loss_cfg.get("clamp_gt_to_capacity", True))
+        self.alignment_loss_enabled = bool(
+            alignment_loss_cfg.get("enabled", False)
+        )
+        self.lambda_align = float(
+            alignment_loss_cfg.get("lambda_align", 0.2)
+        )
+        self.lambda_coarse = float(
+            alignment_loss_cfg.get("lambda_coarse", 0.5)
+        )
+        self.lambda_targetness = float(
+            alignment_loss_cfg.get("lambda_targetness", 0.2)
+        )
+        self.lambda_fine_reg = float(
+            alignment_loss_cfg.get("lambda_fine_reg", 0.02)
+        )
+        self.smooth_l1_beta = float(
+            alignment_loss_cfg.get("smooth_l1_beta", 1.0)
+        )
+        self.targetness_alpha = float(
+            alignment_loss_cfg.get("targetness_alpha", 0.75)
+        )
+        self.targetness_gamma = float(
+            alignment_loss_cfg.get("targetness_gamma", 2.0)
+        )
+        self.clamp_gt_to_capacity = bool(
+            alignment_loss_cfg.get("clamp_gt_to_capacity", True)
+        )
 
         loss_scales = alignment_loss_cfg.get("scales", None)
         self.alignment_loss_scales = (
-            None if loss_scales is None
-            else tuple(sorted({int(s) for s in loss_scales}))
+            None
+            if loss_scales is None
+            else tuple(
+                sorted({int(s) for s in loss_scales})
+            )
         )
 
-        bhlr_scales = tuple(sorted({int(s) for s in bhlr_scales}))
+        # Accept the newer spelling without breaking the old parent API.
+        if "use_for_bhlr" in alignment_cfg:
+            alignment_cfg["use_for_rsdt"] = bool(
+                alignment_cfg["use_for_bhlr"]
+            )
 
+        # Parent is used for:
+        #   dual backbone
+        #   fusion
+        #   head/loss
+        #   alignment plugin
+        #
+        # Its RSD-T object is only a temporary placeholder and is replaced
+        # immediately below. P3 is supplied only to satisfy the old parent API.
         super().__init__(
             model_name=model_name,
             nc=nc,
             pretrained=pretrained,
-            fusion="concat",
+            fusion=fusion,
             fusion_indices=fusion_indices,
             align_mode=align_mode,
             names=names,
             semantic_imgsz=semantic_imgsz,
-            rsdt_scales=bhlr_scales,
+            rsdt_scales=(3,),
             use_guidance=True,
             detail_channels=detail_channels,
             stem_channels=stem_channels,
@@ -104,63 +176,159 @@ class RGBTRLSFABHLRV2DetectionModel(RGBTRSDTDetectionModel):
             verbose=False,
         )
 
-        align_type = str(self.alignment_cfg.get("type", "identity")).strip().lower()
-        if self.alignment_loss_enabled and (not self.alignment_enabled or align_type != "rlsfa"):
-            print("[RLSFA loss] disabled because RLSFA alignment is not active")
+        # ----------------------------------------------------------
+        # RLSFA auxiliary loss is meaningful only when RLSFA is active.
+        # ----------------------------------------------------------
+        align_type = str(
+            self.alignment_cfg.get("type", "identity")
+        ).strip().lower()
+
+        if (
+            self.alignment_loss_enabled
+            and (
+                not self.alignment_enabled
+                or align_type != "rlsfa"
+            )
+        ):
+            print(
+                "[RLSFA loss] disabled because "
+                "RLSFA alignment is not active"
+            )
             self.alignment_loss_enabled = False
 
+        # Initialize possible lazy RLSFA parameters BEFORE optimizer build.
         self._initialize_rlsfa_lazy_modules()
 
-        feature_channels = self._infer_feature_channels()
-        rgb_channels, tir_channels = {}, {}
-        for scale in self.rsdt_scales:
-            idx = self.rsdt_scale_to_index[scale]
-            rgb_channels[scale] = int(feature_channels[idx]["rgb"])
-            tir_channels[scale] = int(feature_channels[idx]["tir"])
+        # ----------------------------------------------------------
+        # Resolve BHLR injection locations.
+        #
+        # Preferred NEW interface:
+        #     bhlr_layers = actual backbone layer IDs
+        #
+        # Legacy interface:
+        #     bhlr_scales = [3,4,5]
+        # maps to the current model's P3/P4/P5 backbone indices.
+        # ----------------------------------------------------------
+        if bhlr_layers is not None:
+            resolved_layers = tuple(
+                sorted({int(i) for i in bhlr_layers})
+            )
 
+        elif bhlr_scales is not None:
+            legacy_scales = tuple(
+                sorted({int(s) for s in bhlr_scales})
+            )
+
+            legacy_map = {
+                3: int(self.fusion_indices[0]),
+                4: int(self.fusion_indices[1]),
+                5: int(self.fusion_indices[2]),
+            }
+
+            invalid_legacy = [
+                s
+                for s in legacy_scales
+                if s not in legacy_map
+            ]
+
+            if invalid_legacy:
+                raise ValueError(
+                    "Legacy bhlr_scales only accepts conceptual P3/P4/P5 "
+                    f"(3/4/5), got {invalid_legacy}. "
+                    "For arbitrary backbone layers use bhlr_layers=[...]."
+                )
+
+            resolved_layers = tuple(
+                sorted({
+                    legacy_map[s]
+                    for s in legacy_scales
+                })
+            )
+
+        else:
+            # Preserve the historical default: P3.
+            resolved_layers = (
+                int(self.fusion_indices[0]),
+            )
+
+        self.bhlr_layers = resolved_layers
+
+        if not self.bhlr_layers:
+            raise ValueError("BHLR injection layer list cannot be empty")
+
+        bad = [
+            i for i in self.bhlr_layers
+            if i < 0 or i >= self.backbone_len
+        ]
+        if bad:
+            raise ValueError(
+                f"BHLR layer IDs out of range: {bad}; "
+                f"valid range is 0..{self.backbone_len - 1}"
+            )
+
+        feature_channels = self._infer_any_layer_channels(
+            self.bhlr_layers
+        )
+
+        rgb_channels = {
+            i: int(feature_channels[i]["rgb"])
+            for i in self.bhlr_layers
+        }
+        tir_channels = {
+            i: int(feature_channels[i]["tir"])
+            for i in self.bhlr_layers
+        }
+
+        # Replace the old P3/P4/P5-only module.
         del self.rsdt
+
         self.bhlr = MultiScaleBHLRv2(
             rgb_channels=rgb_channels,
             tir_channels=tir_channels,
-            scales=self.rsdt_scales,
+            scales=self.bhlr_layers,  # now arbitrary layer IDs
             high_to_semantic_ratio=int(high_to_semantic_ratio),
             detail_channels=int(detail_channels),
             stem_channels=int(stem_channels),
             guide_channels=int(guide_channels),
-            # Kept arguments for old train/val API compatibility.
-            # BHLR-v2 no longer performs its own global FFT.
             freq_cutoff=float(bhlr_freq_cutoff),
             freq_sharpness=float(bhlr_freq_sharpness),
-
-            # BHLR-v2 dual-mode guidance.
-            guidance_mode=self.bhlr_guidance_mode,
-            detach_external_guidance=self.bhlr_detach_external_guidance,
-
-            # RLSFA reliable structures use hidden_channels channels.
-            external_structure_channels=int(
-                self.alignment_cfg.get("hidden_channels", 32)
-            ),
-
             exact_identity_when_equal=True,
+            guidance_mode=str(guidance_mode),
+            detach_external_guidance=bool(detach_external_guidance),
+            external_structure_channels=int(external_structure_channels),
         )
+
+        # Compatibility aliases for older training/visualization code.
         self.rsdt = self.bhlr
-        self.bhlr_scales = self.rsdt_scales
+        self.bhlr_scales = self.bhlr_layers
+        self.rsdt_scales = self.bhlr_layers
 
         if verbose:
             print("\n============================================================")
-            print("RLSFA + BHLR-v2 RGB-T Detector")
+            print("RLSFA + BHLR-v2 ANY-LAYER Detector")
             print("============================================================")
             print(f"Model              : {self.model_name}")
-            print("Fusion             : concat (Module-3 OFF)")
-            print(f"RLSFA enabled      : {self.alignment_enabled}")
-            print(f"RLSFA scales       : {list(getattr(self.alignment, 'scales', []))}")
-            print(f"BHLR scales        : {list(self.bhlr_scales)}")
-            print(f"BHLR guidance      : {self.bhlr_guidance_mode}")
-            print(f"Detach ext guide   : {self.bhlr_detach_external_guidance}")
-            print(f"RGB semantic       : {self.semantic_imgsz}")
-            print(f"High/semantic ratio: {high_to_semantic_ratio}")
+            print(f"Backbone length    : {self.backbone_len}")
+            print(f"BHLR layer IDs     : {list(self.bhlr_layers)}")
+            if bhlr_layers is not None:
+                print("BHLR config mode   : actual backbone layer IDs")
+            elif bhlr_scales is not None:
+                print(
+                    f"BHLR config mode   : legacy scales {list(bhlr_scales)} "
+                    f"-> layers {list(self.bhlr_layers)}"
+                )
+            else:
+                print("BHLR config mode   : default P3 -> actual layer ID")
+            for i in self.bhlr_layers:
+                print(
+                    f"  layer {i:<2}: "
+                    f"RGB C={rgb_channels[i]}, "
+                    f"TIR C={tir_channels[i]}"
+                )
+            print(f"Alignment enabled  : {self.alignment_enabled}")
+            print(f"Alignment type     : {self.alignment_cfg.get('type', 'identity')}")
             print(f"Alignment loss     : {self.alignment_loss_enabled}")
-            print("Geometry           : translation-only; no affine/dense deformation")
+            print("Injection mode     : INLINE / propagates downstream")
             print("============================================================\n")
 
     @torch.no_grad()
@@ -189,288 +357,319 @@ class RGBTRLSFABHLRV2DetectionModel(RGBTRSDTDetectionModel):
         if bad:
             raise RuntimeError("RLSFA lazy parameters remain uninitialized: " + ", ".join(bad))
 
-    @staticmethod
-    def _extract_bhlr_external_guidance(
-        alignment_info: Dict,
-        scales,
-    ):
-        """
-        Convert the CURRENT RLSFA debug outputs to a BHLR-v2-neutral API.
 
-        BHLR-v2 does not import or know about RLSFA.
-        It only receives:
-            rgb_structure
-            tir_structure
-            targetness
-        """
-        mapping = alignment_info.get(
+    # ------------------------------------------------------------------
+    # Channel inference for arbitrary backbone indices.
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _infer_any_layer_channels(
+        self,
+        layer_ids: Iterable[int],
+    ) -> Dict[int, Dict[str, int]]:
+        layer_ids = tuple(int(i) for i in layer_ids)
+
+        rgb_training = self.model.training
+        tir_training = self.tir_backbone.training
+
+        self.model.eval()
+        self.tir_backbone.eval()
+
+        device = next(self.model.parameters()).device
+        dummy = torch.zeros(
+            1, 3, 256, 256,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        rgb_outputs = list(
+            self.forward_rgb_backbone(dummy)
+        )
+        tir_outputs = list(
+            self.forward_tir_backbone(dummy)
+        )
+
+        channels: Dict[int, Dict[str, int]] = {}
+
+        for i in layer_ids:
+            r = rgb_outputs[i]
+            t = tir_outputs[i]
+
+            if not isinstance(r, torch.Tensor):
+                raise TypeError(
+                    f"RGB backbone layer {i} does not return a Tensor"
+                )
+            if not isinstance(t, torch.Tensor):
+                raise TypeError(
+                    f"TIR backbone layer {i} does not return a Tensor"
+                )
+
+            channels[i] = {
+                "rgb": int(r.shape[1]),
+                "tir": int(t.shape[1]),
+            }
+
+        self.model.train(rgb_training)
+        self.tir_backbone.train(tir_training)
+
+        return channels
+
+    # ------------------------------------------------------------------
+    # Optional RLSFA guidance -> actual backbone layer IDs.
+    #
+    # RLSFA is still P-level based. If a BHLR layer corresponds to one of
+    # RLSFA's P3/P4/P5 indices, external guidance is reused. Other arbitrary
+    # layers automatically fall back when guidance_mode="auto".
+    # ------------------------------------------------------------------
+    def _alignment_guidance_by_layer(
+        self,
+        alignment_info: Optional[Mapping],
+    ) -> Dict[int, Dict[str, torch.Tensor]]:
+        if not alignment_info:
+            return {}
+
+        scale_debug = alignment_info.get(
             "scale_debug",
             alignment_info.get("scales", {}),
         )
 
-        result = {}
+        if not isinstance(scale_debug, Mapping):
+            return {}
 
-        for scale in scales:
-            if scale in mapping:
-                dbg = mapping[scale]
-            elif str(scale) in mapping:
-                dbg = mapping[str(scale)]
-            else:
+        result: Dict[int, Dict[str, torch.Tensor]] = {}
+
+        for scale_key, dbg in scale_debug.items():
+            try:
+                scale = int(scale_key)
+            except Exception:
+                continue
+
+            if scale not in self.rsdt_scale_to_index:
+                continue
+
+            layer_id = int(
+                self.rsdt_scale_to_index[scale]
+            )
+
+            if not isinstance(dbg, Mapping):
                 continue
 
             required = (
-                "rgb_reliable_structure",
-                "tir_reliable_structure",
-                "coarse_targetness",
+                "rgb_structure",
+                "tir_structure",
+                "targetness",
             )
 
-            if not all(
-                key in dbg
-                for key in required
-            ):
-                continue
-
-            result[scale] = {
-                "rgb_structure":
-                    dbg["rgb_reliable_structure"],
-
-                "tir_structure":
-                    dbg["tir_reliable_structure"],
-
-                "targetness":
-                    dbg["coarse_targetness"],
-            }
+            if all(k in dbg for k in required):
+                result[layer_id] = {
+                    "rgb_structure": dbg["rgb_structure"],
+                    "tir_structure": dbg["tir_structure"],
+                    "targetness": dbg["targetness"],
+                }
 
         return result
 
+    # ------------------------------------------------------------------
+    # TRUE inline RGB backbone execution.
+    # ------------------------------------------------------------------
+    def _forward_rgb_backbone_with_bhlr(
+        self,
+        rgb_high: torch.Tensor,
+        rgb_semantic: torch.Tensor,
+        tir_features: Sequence[torch.Tensor],
+        external_guidance_by_layer: Optional[Mapping[int, Mapping]] = None,
+        return_debug: bool = False,
+    ):
+        external_guidance_by_layer = dict(
+            external_guidance_by_layer or {}
+        )
+
+        # If high == semantic and exact bypass is enabled, use the normal
+        # backbone because there is no lost-detail branch to inject.
+        equal_resolution = (
+            rgb_high.shape[-2:]
+            == rgb_semantic.shape[-2:]
+        )
+
+        if equal_resolution and self.bhlr.exact_identity_when_equal:
+            outputs = list(
+                self.forward_rgb_backbone(rgb_semantic)
+            )
+
+            if return_debug:
+                return outputs, {
+                    "equal_resolution": True,
+                    "detail_raw": None,
+                    "detail_bank": None,
+                    "layers": {},
+                    "scales": {},  # compatibility
+                }
+
+            return outputs, None
+
+        (
+            detail_raw,
+            reconstructed_high,
+            residual_high,
+        ) = self.bhlr.build_lost_detail_bank(
+            rgb_high,
+            rgb_semantic,
+        )
+
+        layers = list(self.model)[:self.backbone_len]
+
+        outputs = []
+        x = rgb_semantic
+
+        debug_layers: Dict[int, Dict] = {}
+
+        for layer_id, module in enumerate(layers):
+            module_input = get_layer_input(
+                module,
+                x,
+                outputs,
+            )
+
+            x = module(module_input)
+
+            # ----------------------------------------------------------
+            # Inject IMMEDIATELY after this selected RGB backbone layer.
+            # The enhanced tensor is then stored in outputs and therefore
+            # participates in every later layer that depends on it.
+            # ----------------------------------------------------------
+            if layer_id in self.bhlr_layers:
+                guidance = external_guidance_by_layer.get(
+                    layer_id,
+                    None,
+                )
+
+                if return_debug:
+                    x, dbg = self.bhlr.enhance_layer(
+                        layer_id=layer_id,
+                        detail_raw=detail_raw,
+                        rgb_feat=x,
+                        tir_feat=tir_features[layer_id],
+                        external_guidance=guidance,
+                        return_debug=True,
+                    )
+                    debug_layers[layer_id] = dbg
+                else:
+                    x = self.bhlr.enhance_layer(
+                        layer_id=layer_id,
+                        detail_raw=detail_raw,
+                        rgb_feat=x,
+                        tir_feat=tir_features[layer_id],
+                        external_guidance=guidance,
+                        return_debug=False,
+                    )
+
+            outputs.append(x)
+
+        if not return_debug:
+            return outputs, None
+
+        residual_s2d = F.pixel_unshuffle(
+            residual_high,
+            downscale_factor=self.bhlr.ratio,
+        )
+
+        debug = {
+            "equal_resolution": False,
+            "reconstructed_high": reconstructed_high,
+            "resolution_residual": residual_high,
+            "residual_s2d": residual_s2d,
+            "detail_raw": detail_raw,
+            "detail_bank": detail_raw,
+            "layers": debug_layers,
+
+            # compatibility with old visualizers
+            "scales": debug_layers,
+        }
+
+        return outputs, debug
+
+    # ------------------------------------------------------------------
+    # Main forward
+    # ------------------------------------------------------------------
     def forward_features(
         self,
-        rgb,
-        tir,
-        rgb_semantic=None,
+        rgb: torch.Tensor,
+        tir: torch.Tensor,
+        rgb_semantic: Optional[torch.Tensor] = None,
         return_rsdt_debug: bool = False,
         return_alignment_debug: bool = False,
-    ):
+    ) -> Dict:
         if rgb_semantic is None:
             rgb_semantic = self._fallback_semantic_rgb(
                 rgb
             )
 
-        # -----------------------------------------------------
-        # 1. Original semantic RGB/TIR backbones.
-        # -----------------------------------------------------
-        rgb_outputs = list(
-            self.forward_rgb_backbone(
-                rgb_semantic
-            )
-        )
-
+        # TIR is run once.
         raw_tir_outputs = list(
-            self.forward_tir_backbone(
-                tir
-            )
+            self.forward_tir_backbone(tir)
         )
 
-        # -----------------------------------------------------
-        # 2. Optional RLSFA alignment.
-        #
-        # For BHLR-v2 external/auto mode, we need the CURRENT
-        # RLSFA reliable structures. RLSFA already computes these;
-        # return_debug=True only exposes them, it does not introduce
-        # another alignment branch.
-        # -----------------------------------------------------
-        align_type = str(
-            self.alignment_cfg.get(
-                "type",
-                "identity",
-            )
-        ).strip().lower()
-
-        can_use_external = (
+        need_alignment = bool(
             self.alignment_enabled
-            and align_type == "rlsfa"
-            and self.alignment_use_for_rsdt
         )
 
-        wants_external = (
-            self.bhlr_guidance_mode
-            in (
-                "auto",
-                "external",
-            )
-        )
+        # RLSFA currently needs a reference RGB feature set.
+        # This raw pre-pass is only required when alignment is active.
+        raw_rgb_for_alignment = None
+        alignment_info: Dict[str, Any] = {}
 
-        if (
-            self.bhlr_guidance_mode
-            == "external"
-            and not can_use_external
-        ):
-            raise RuntimeError(
-                "BHLR-v2 guidance_mode='external' "
-                "requires active RLSFA and "
-                "alignment.use_for_bhlr=true."
+        if need_alignment:
+            raw_rgb_for_alignment = list(
+                self.forward_rgb_backbone(
+                    rgb_semantic
+                )
             )
 
-        need_alignment_debug = (
-            return_alignment_debug
-            or return_rsdt_debug
-            or (
-                wants_external
-                and can_use_external
-            )
-        )
-
-        (
-            aligned_tir_outputs,
-            alignment_info,
-        ) = self.alignment(
-            rgb_features=rgb_outputs,
-            tir_features=raw_tir_outputs,
-            scale_to_index=self.rsdt_scale_to_index,
-            return_debug=need_alignment_debug,
-        )
-
-        # -----------------------------------------------------
-        # 3. Existing routing policy.
-        # -----------------------------------------------------
-        if (
-            self.alignment_enabled
-            and self.alignment_use_for_rsdt
-        ):
-            tir_for_bhlr = (
-                aligned_tir_outputs
+            (
+                aligned_tir_outputs,
+                alignment_info,
+            ) = self.alignment(
+                rgb_features=raw_rgb_for_alignment,
+                tir_features=raw_tir_outputs,
+                scale_to_index=self.rsdt_scale_to_index,
+                return_debug=(
+                    return_alignment_debug
+                    or return_rsdt_debug
+                ),
             )
         else:
-            tir_for_bhlr = (
-                raw_tir_outputs
-            )
+            aligned_tir_outputs = raw_tir_outputs
+
+        if (
+            self.alignment_enabled
+            and self.alignment_use_for_rsdt
+        ):
+            tir_for_bhlr = aligned_tir_outputs
+        else:
+            tir_for_bhlr = raw_tir_outputs
 
         if (
             self.alignment_enabled
             and self.alignment_use_for_fusion
         ):
-            tir_for_fusion = (
-                aligned_tir_outputs
-            )
+            tir_for_fusion = aligned_tir_outputs
         else:
-            tir_for_fusion = (
-                raw_tir_outputs
-            )
+            tir_for_fusion = raw_tir_outputs
 
-        # -----------------------------------------------------
-        # 4. Optional RLSFA -> BHLR-v2 structural guidance.
-        #
-        # auto:
-        #   RLSFA available -> use external
-        #   RLSFA absent    -> BHLR fallback
-        #
-        # fallback:
-        #   force BHLR self spatial guidance even when RLSFA exists
-        #
-        # external:
-        #   require RLSFA guidance
-        # -----------------------------------------------------
-        external_guidance = None
+        guidance_by_layer = self._alignment_guidance_by_layer(
+            alignment_info
+        )
 
-        if (
-            can_use_external
-            and self.bhlr_guidance_mode
-            in (
-                "auto",
-                "external",
-            )
-        ):
-            external_guidance = (
-                self._extract_bhlr_external_guidance(
-                    alignment_info,
-                    self.bhlr_scales,
-                )
-            )
+        (
+            rgb_outputs,
+            bhlr_debug,
+        ) = self._forward_rgb_backbone_with_bhlr(
+            rgb_high=rgb,
+            rgb_semantic=rgb_semantic,
+            tir_features=tir_for_bhlr,
+            external_guidance_by_layer=guidance_by_layer,
+            return_debug=return_rsdt_debug,
+        )
 
-            if (
-                self.bhlr_guidance_mode
-                == "external"
-            ):
-                missing = [
-                    scale
-                    for scale in self.bhlr_scales
-                    if scale
-                    not in external_guidance
-                ]
-
-                if missing:
-                    raise RuntimeError(
-                        "RLSFA external guidance "
-                        "missing for BHLR scales "
-                        f"{missing}."
-                    )
-
-        # -----------------------------------------------------
-        # 5. Select scale features and run BHLR-v2.
-        # -----------------------------------------------------
-        rgb_scale_features = {}
-        tir_scale_features = {}
-
-        for scale in self.bhlr_scales:
-            index = (
-                self.rsdt_scale_to_index[
-                    scale
-                ]
-            )
-
-            rgb_scale_features[
-                scale
-            ] = rgb_outputs[
-                index
-            ]
-
-            tir_scale_features[
-                scale
-            ] = tir_for_bhlr[
-                index
-            ]
-
-        bhlr_debug = None
-
-        if return_rsdt_debug:
-            (
-                enhanced_features,
-                bhlr_debug,
-            ) = self.bhlr(
-                rgb_high=rgb,
-                rgb_semantic=rgb_semantic,
-                rgb_features=rgb_scale_features,
-                tir_features=tir_scale_features,
-                external_guidance=external_guidance,
-                return_debug=True,
-            )
-        else:
-            enhanced_features = self.bhlr(
-                rgb_high=rgb,
-                rgb_semantic=rgb_semantic,
-                rgb_features=rgb_scale_features,
-                tir_features=tir_scale_features,
-                external_guidance=external_guidance,
-                return_debug=False,
-            )
-
-        # Replace only selected RGB pyramid features.
-        for scale in self.bhlr_scales:
-            index = (
-                self.rsdt_scale_to_index[
-                    scale
-                ]
-            )
-
-            rgb_outputs[
-                index
-            ] = enhanced_features[
-                scale
-            ]
-
-        # -----------------------------------------------------
-        # 6. Existing RGB-T concat fusion / original neck-head.
-        # -----------------------------------------------------
         (
             fused_outputs,
             fusion_features,
@@ -480,74 +679,40 @@ class RGBTRLSFABHLRV2DetectionModel(RGBTRSDTDetectionModel):
         )
 
         result = {
-            "rgb_backbone":
-                rgb_outputs,
+            "rgb_backbone": rgb_outputs,
+            "tir_backbone": raw_tir_outputs,
+            "aligned_tir_backbone": aligned_tir_outputs,
+            "tir_for_rsdt": tir_for_bhlr,
+            "tir_for_bhlr": tir_for_bhlr,
+            "tir_for_fusion": tir_for_fusion,
+            "fused_backbone": fused_outputs,
+            "fusion_features": fusion_features,
+            "rgb_semantic": rgb_semantic,
 
-            "tir_backbone":
-                raw_tir_outputs,
+            "bhlr_layers": self.bhlr_layers,
 
-            "aligned_tir_backbone":
-                aligned_tir_outputs,
+            # Old-key compatibility.
+            "rsdt_scales": self.bhlr_layers,
+            "bhlr_scales": self.bhlr_layers,
 
-            # Old compatibility key.
-            "tir_for_rsdt":
-                tir_for_bhlr,
-
-            "tir_for_bhlr":
-                tir_for_bhlr,
-
-            "tir_for_fusion":
-                tir_for_fusion,
-
-            "fused_backbone":
-                fused_outputs,
-
-            "fusion_features":
-                fusion_features,
-
-            "rgb_semantic":
-                rgb_semantic,
-
-            "rsdt_scales":
-                self.bhlr_scales,
-
-            "bhlr_scales":
-                self.bhlr_scales,
-
-            "rsdt_scale_to_index":
-                dict(
-                    self.rsdt_scale_to_index
-                ),
-
-            "alignment_enabled":
-                self.alignment_enabled,
-
-            "alignment_type":
-                self.alignment_cfg.get(
-                    "type",
-                    "identity",
-                ),
-
-            "bhlr_guidance_mode":
-                self.bhlr_guidance_mode,
+            "alignment_enabled": self.alignment_enabled,
+            "alignment_type": self.alignment_cfg.get(
+                "type",
+                "identity",
+            ),
         }
 
+        if raw_rgb_for_alignment is not None:
+            result[
+                "rgb_backbone_raw_for_alignment"
+            ] = raw_rgb_for_alignment
+
         if return_rsdt_debug:
-            result[
-                "rsdt_debug"
-            ] = bhlr_debug
+            result["rsdt_debug"] = bhlr_debug
+            result["bhlr_debug"] = bhlr_debug
 
-            result[
-                "bhlr_debug"
-            ] = bhlr_debug
-
-        if (
-            return_alignment_debug
-            or return_rsdt_debug
-        ):
-            result[
-                "alignment_info"
-            ] = alignment_info
+        if return_alignment_debug or return_rsdt_debug:
+            result["alignment_info"] = alignment_info
 
         return result
 
@@ -737,3 +902,83 @@ class RGBTRLSFABHLRV2DetectionModel(RGBTRSDTDetectionModel):
             "align_valid_pairs": float(stats["align_valid_pairs"]),
         })
         return total_raw, items
+
+    # ------------------------------------------------------------------
+    # Utility: print actual layer IDs / channels / spatial sizes.
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def print_backbone_table(
+        self,
+        imgsz: int = 640,
+    ):
+        training = self.model.training
+        self.model.eval()
+
+        device = next(self.model.parameters()).device
+        x = torch.zeros(
+            1, 3, int(imgsz), int(imgsz),
+            device=device,
+        )
+
+        outputs = list(
+            self.forward_rgb_backbone(x)
+        )
+
+        print("\nRGB backbone layer table")
+        print("-" * 74)
+        print(
+            f"{'ID':>4}  {'Module':<28} "
+            f"{'Channels':>9}  {'H':>6}  {'W':>6}"
+        )
+        print("-" * 74)
+
+        layers = list(self.model)[:self.backbone_len]
+
+        for i, (m, y) in enumerate(zip(layers, outputs)):
+            if isinstance(y, torch.Tensor):
+                c = int(y.shape[1])
+                h = int(y.shape[-2])
+                w = int(y.shape[-1])
+                shape_text = f"{c:>9}  {h:>6}  {w:>6}"
+            else:
+                shape_text = f"{'non-Tensor':>23}"
+
+            print(
+                f"{i:>4}  "
+                f"{m.__class__.__name__:<28} "
+                f"{shape_text}"
+            )
+
+        print("-" * 74)
+        print(
+            "Configured BHLR layers:",
+            list(self.bhlr_layers),
+        )
+        print()
+
+        self.model.train(training)
+
+
+# ------------------------------------------------------------------
+# Backward-compatible public class name expected by the existing trainer:
+#
+#     from models.rgbt_rlsfa_bhlr_model_v2 import (
+#         RGBTRLSFABHLRV2DetectionModel
+#     )
+# ------------------------------------------------------------------
+class RGBTRLSFABHLRV2DetectionModel(
+    RGBTRLSFABHLRAnyLayerDetectionModel
+):
+    pass
+
+
+# Optional aliases.
+AnyLayerBHLRModel = RGBTRLSFABHLRAnyLayerDetectionModel
+RGBTRLSFABHLRModelV2 = RGBTRLSFABHLRV2DetectionModel
+
+__all__ = [
+    "RGBTRLSFABHLRV2DetectionModel",
+    "RGBTRLSFABHLRAnyLayerDetectionModel",
+    "RGBTRLSFABHLRModelV2",
+    "AnyLayerBHLRModel",
+]
